@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Browser Proxy</title>
+    <link rel="icon" href="data:," />
+
+    <!-- Scramjet client + bare-mux (expose $scramjetLoadController / BareMux globals) -->
+    <script src="/scram/scramjet.all.js"></script>
+    <script src="/baremux/index.js"></script>
+
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/register-sw.js" defer></script>
+    <script src="/search.js" defer></script>
+    <script src="/index.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Browser Proxy</h1>
+      <p class="tagline">Type any URL and browse it through this server.</p>
+
+      <form id="proxy-form" autocomplete="off">
+        <input
+          id="proxy-address"
+          type="text"
+          inputmode="url"
+          placeholder="example.com  or  a search query"
+          aria-label="URL to proxy"
+          autofocus
+        />
+        <button type="submit">Go</button>
+      </form>
+
+      <p id="proxy-status" class="status"></p>
+      <p id="proxy-error" class="error"></p>
+      <pre id="proxy-error-code" class="error-code"></pre>
+
+      <footer>
+        Powered by <a href="https://github.com/MercuryWorkshop/scramjet">Scramjet</a>
+        over a Rust Wisp backend.
+      </footer>
+    </main>
+  </body>
+</html>

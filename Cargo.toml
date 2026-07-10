@@ -1,0 +1,29 @@
+[package]
+name = "browser-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted web proxy: Scramjet client + Rust Wisp backend"
+license = "MIT"
+
+[[bin]]
+name = "browser-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "set-header", "trace"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
