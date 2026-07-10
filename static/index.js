@@ -7,7 +7,15 @@ const errorEl = document.getElementById("proxy-error");
 const errorCode = document.getElementById("proxy-error-code");
 const frameHost = document.getElementById("frame-host");
 
-const SEARCH_TEMPLATE = "https://www.google.com/search?q=%s";
+// Search engine used when the input is NOT a valid URL / IP / domain (see search.js).
+// Google aggressively CAPTCHAs proxied traffic (all requests share one IP + the libcurl-WASM
+// TLS fingerprint looks non-browser), so we default to a proxy-friendly engine. Swap to taste:
+//   Brave      : "https://search.brave.com/search?q=%s"   (default)
+//   DuckDuckGo : "https://duckduckgo.com/?q=%s"
+//   DDG (lite) : "https://lite.duckduckgo.com/lite/?q=%s"
+//   Bing       : "https://www.bing.com/search?q=%s"
+//   Google     : "https://www.google.com/search?q=%s"     (expect CAPTCHAs via a proxy)
+const SEARCH_TEMPLATE = "https://search.brave.com/search?q=%s";
 
 // Scramjet controller: knows where its wasm/runtime files live.
 const { ScramjetController } = $scramjetLoadController();
