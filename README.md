@@ -58,47 +58,84 @@ Then open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press
 | `MAX_STREAMS` | `256` | Max concurrent streams per connection (further CONNECTs get refused). |
 | `BLOCK_PRIVATE` | `0` | `1`/`true` refuses targets on private/loopback/link-local IPs (SSRF guard). |
 | `HOST_BLACKLIST` | *(empty)* | Comma-separated hostname substrings to refuse. |
-| `ROUTES` | *(empty)* | Comma-separated `name=socks5://[user:pass@]host:port` upstream routes, selectable in the UI via `?route=`. `direct` is always available. A malformed value aborts startup. See [Routing through a VPN](#routing-through-a-vpn). |
+| `CONFIG` | `config.yaml` | Path to the YAML route config (see below). The default path being absent is fine (routes = `direct` only); an explicitly-set but missing/malformed config aborts startup. |
 | `RUST_LOG` | `browser_proxy=info` | Log filter (`tower_http=debug` to log every request). |
 
 ## Routing through a VPN
 
-Outbound connections can be sent through any VPN or proxy that exposes a **SOCKS5**
-endpoint, chosen per-navigation from a dropdown in the UI. Target sites then see the VPN's
-IP, not the server's.
+Outbound connections can be sent through a VPN or proxy, chosen per-navigation from a
+dropdown (on the landing page and in the top bar). Target sites then see the route's IP, not
+the server's. Routes are defined in a YAML config file (`config.yaml` by default, or set
+`CONFIG`). `direct` (no proxy) always exists; the dropdown is hidden when no other route is
+configured. See [`config.example.yaml`](config.example.yaml).
 
-Define named routes in `ROUTES` and pick one in the UI. `direct` (no proxy) is always
-present; the dropdown is hidden when no other route is configured.
+```yaml
+routes:
+  # Cloudflare WARP, registered in-process (one binary, no warp-cli / wireproxy):
+  - name: warp
+    type: warp
 
-**Cloudflare WARP** (`1.1.1.1`): run WARP in proxy mode, which exposes a local SOCKS5
-listener *without* capturing the host routing table (so `direct` still goes out directly):
+  # A generic WireGuard peer you configure yourself (e.g. wgcf-generated):
+  - name: myvpn
+    type: wireguard
+    private_key: "<base64 private key>"
+    peer_public_key: "<base64 peer public key>"
+    endpoint: "engage.cloudflareclient.com:2408"
+    address: "172.16.0.2/32"
 
-```bash
-warp-cli mode proxy          # SOCKS5 on 127.0.0.1:40000 by default
-warp-cli connect
-ROUTES="warp=socks5://127.0.0.1:40000" cargo run --release
+  # A SOCKS5 upstream (Tor, or WARP in `warp-cli mode proxy`, etc.):
+  - name: tor
+    type: socks5
+    address: "127.0.0.1:9050"
+
+  # An HTTP CONNECT proxy (optional credentials):
+  - name: corp
+    type: http
+    address: "127.0.0.1:8080"
+    # username: "u"
+    # password: "p"
 ```
 
-**Tor**: `ROUTES="tor=socks5://127.0.0.1:9050"` (with the Tor daemon running).
+Then `cargo run --release` (with `config.yaml` in the working directory) and pick the route
+in the UI.
 
-Several at once:
+### Route types
 
-```bash
-ROUTES="warp=socks5://127.0.0.1:40000,tor=socks5://127.0.0.1:9050" cargo run --release
-```
+- **`warp`** — an embedded Cloudflare WARP tunnel. The server registers a WARP account on
+  first start (via Cloudflare's unofficial registration API, the same one `wgcf` uses) and
+  caches the credentials to `warp-<name>.json` (mode `0600` on Unix) so it does not
+  re-register on every boot. No `warp-cli` or other sidecar process is needed.
+- **`wireguard`** — a generic WireGuard peer you supply. Use this with any WireGuard provider;
+  for WARP without in-process registration, generate a config with
+  [`wgcf`](https://github.com/ViRb3/wgcf) and paste the keys.
+- **`socks5`** — any SOCKS5 proxy (Tor on `127.0.0.1:9050`; WARP via `warp-cli mode proxy` on
+  `127.0.0.1:40000`; etc.).
+- **`http`** — any HTTP proxy that supports the CONNECT method.
+
+The `warp` and `wireguard` tunnels are userspace ([`boringtun`](https://github.com/cloudflare/boringtun)
++ [`smoltcp`](https://github.com/smoltcp-rs/smoltcp)); they need no root, no `NET_ADMIN`, and
+do not touch the host routing table.
 
 **Fail closed.** If the selected route doesn't exist the WebSocket upgrade is rejected
-(HTTP 400); if the proxy is down the stream closes. Traffic is *never* silently sent
+(HTTP 400); if the upstream is down the stream closes. Traffic is *never* silently sent
 directly when a VPN route was requested.
 
-**DNS.** On a SOCKS5 route the target hostname is handed to the proxy to resolve, so no DNS
+**DNS.** On a `socks5`/`http` route the hostname is handed to the proxy to resolve; on a
+`wireguard`/`warp` route it is resolved via `1.1.1.1` *inside* the tunnel. Either way no DNS
 query for the destination leaves this machine.
 
-**Two caveats within the "personal use" scope:**
+**Caveats within the "personal use" scope:**
 
-- `BLOCK_PRIVATE` cannot filter a *hostname* on a SOCKS5 route (the name is resolved by the
-  proxy, not here). IP-literal targets are still checked. The SSRF exposure is smaller on a
-  VPN route anyway, since connections originate from the VPN's network, not this host.
+- The **WARP registration API is unofficial** and may change; if `type: warp` stops
+  registering, delete `warp-<name>.json` or switch to a `wgcf`-generated `type: wireguard`
+  route.
+- Embedding WireGuard roughly **doubles the dependency tree and build time** (`boringtun`,
+  `smoltcp`, `ureq`, and their transitive crates). If you only need `socks5`/`http` routes,
+  the tunnel is still compiled in.
+- `BLOCK_PRIVATE` cannot filter a *hostname* on a `socks5`/`http`/`wireguard` route (the name
+  is resolved by the proxy or inside the tunnel, not here). IP-literal targets are still
+  checked. The SSRF exposure is smaller on a VPN route anyway, since connections originate
+  from the VPN's network, not this host.
 - The client transport is a **SharedWorker shared across all tabs** of the origin. Selecting
   a route affects every open tab, not just the current one. Use one tab at a time if you
   rely on per-tab routes.
