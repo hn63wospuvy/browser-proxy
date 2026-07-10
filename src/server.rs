@@ -1,10 +1,11 @@
 //! The axum HTTP router: static assets + the `/wisp/` WebSocket endpoint.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header::{HeaderName, HeaderValue, CACHE_CONTROL};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -16,6 +17,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
+use crate::route::DIRECT;
 use crate::{metrics, wisp};
 
 /// Cap on a single WebSocket message / frame. Wisp DATA frames from the real client are
@@ -45,6 +47,7 @@ pub fn build_router(cfg: Arc<Config>, static_dir: &str) -> Router {
         .route("/wisp/", get(ws_handler))
         .route("/wisp", get(ws_handler))
         .route("/debug/stats", get(stats_handler))
+        .route("/routes.json", get(routes_handler))
         .nest_service("/scram", sd("scram"))
         .nest_service("/baremux", sd("baremux"))
         .nest_service("/libcurl", sd("libcurl"))
@@ -69,7 +72,22 @@ fn header_layer(name: &'static str, value: &'static str) -> SetResponseHeaderLay
     )
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    // Resolve the requested route BEFORE acquiring a connection permit, so a bad request
+    // doesn't consume a slot. Unknown route → 400, never a silent direct fallback.
+    let route_name = params.get("route").map(String::as_str).unwrap_or(DIRECT);
+    let route = match state.cfg.routes.get(route_name) {
+        Some(r) => Arc::new(r.clone()),
+        None => {
+            return (StatusCode::BAD_REQUEST, format!("unknown route: {route_name}"))
+                .into_response();
+        }
+    };
+
     // Reject the upgrade if we're already at the connection cap.
     let permit = match state.conn_sem.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -85,8 +103,26 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
         .on_upgrade(move |socket| async move {
             // Hold the permit for the whole connection; released when this future ends.
             let _permit = permit;
-            wisp::handle_connection(socket, cfg).await;
+            wisp::handle_connection(socket, cfg, route).await;
         })
+}
+
+/// List the configured route names as JSON. `direct` is sorted first so the UI shows it as
+/// the default; the rest are alphabetical for stable output.
+async fn routes_handler(State(state): State<AppState>) -> Response {
+    let mut names: Vec<&String> = state.cfg.routes.keys().collect();
+    names.sort_by(|a, b| (a.as_str() != DIRECT, a.as_str()).cmp(&(b.as_str() != DIRECT, b.as_str())));
+    let items = names
+        .iter()
+        .map(|n| format!("{n:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!("{{\"routes\":[{items}]}}");
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 async fn stats_handler() -> Response {

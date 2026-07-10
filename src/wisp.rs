@@ -18,7 +18,6 @@
 //! per-stream memory is hard-capped — it can never grow without bound.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -26,12 +25,12 @@ use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
-use crate::config::{is_private_ip, Config};
+use crate::config::Config;
 use crate::metrics;
+use crate::route::Route;
 
 // Packet types.
 const T_CONNECT: u8 = 0x01;
@@ -43,13 +42,13 @@ const T_CLOSE: u8 = 0x04;
 const ST_TCP: u8 = 0x01;
 
 // Close reasons.
-const R_VOLUNTARY: u8 = 0x02;
-const R_NETWORK: u8 = 0x03;
-const R_INVALID: u8 = 0x41;
-const R_UNREACHABLE: u8 = 0x42;
-const R_TIMEOUT: u8 = 0x43;
-const R_REFUSED: u8 = 0x44;
-const R_BLOCKED: u8 = 0x48;
+pub(crate) const R_VOLUNTARY: u8 = 0x02;
+pub(crate) const R_NETWORK: u8 = 0x03;
+pub(crate) const R_INVALID: u8 = 0x41;
+pub(crate) const R_UNREACHABLE: u8 = 0x42;
+pub(crate) const R_TIMEOUT: u8 = 0x43;
+pub(crate) const R_REFUSED: u8 = 0x44;
+pub(crate) const R_BLOCKED: u8 = 0x48;
 
 /// How many bytes of TCP payload we read per DATA packet toward the client.
 const READ_CHUNK: usize = 16 * 1024;
@@ -140,7 +139,7 @@ struct StreamHandle {
 }
 
 /// Entry point: drive one Wisp connection to completion.
-pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
+pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>, route: Arc<Route>) {
     metrics::inc(&metrics::connections_total);
     let (mut sink, mut ws_stream) = socket.split();
 
@@ -231,6 +230,7 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
                             ws_tx.clone(),
                             done_tx.clone(),
                             cfg.clone(),
+                            route.clone(),
                             outstanding.clone(),
                         ));
                         streams.insert(
@@ -299,44 +299,6 @@ enum Outcome {
     Unknown,
 }
 
-/// Resolve + connect to the target, honoring the SSRF guard and blacklist.
-/// Returns the connected socket, or a Wisp close reason on failure.
-async fn connect_target(host: &str, port: u16, cfg: &Config) -> Result<TcpStream, u8> {
-    if cfg.is_host_blacklisted(host) {
-        return Err(R_BLOCKED);
-    }
-
-    let mut addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
-        Ok(it) => it.collect(),
-        Err(_) => return Err(R_UNREACHABLE),
-    };
-    if cfg.block_private {
-        addrs.retain(|a| !is_private_ip(&a.ip()));
-    }
-    if addrs.is_empty() {
-        // Nothing resolved, or every result was filtered by the SSRF guard.
-        return Err(if cfg.block_private { R_BLOCKED } else { R_UNREACHABLE });
-    }
-
-    let mut last = R_UNREACHABLE;
-    for addr in addrs {
-        match tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                let _ = stream.set_nodelay(true);
-                return Ok(stream);
-            }
-            Ok(Err(e)) => {
-                last = match e.kind() {
-                    std::io::ErrorKind::ConnectionRefused => R_REFUSED,
-                    _ => R_UNREACHABLE,
-                };
-            }
-            Err(_) => last = R_TIMEOUT, // elapsed
-        }
-    }
-    Err(last)
-}
-
 /// Relay one stream: connect, then pump both directions until either side ends.
 #[allow(clippy::too_many_arguments)]
 async fn run_stream(
@@ -347,9 +309,10 @@ async fn run_stream(
     ws_tx: mpsc::Sender<Message>,
     done_tx: mpsc::UnboundedSender<u32>,
     cfg: Arc<Config>,
+    route: Arc<Route>,
     outstanding: Arc<AtomicU32>,
 ) {
-    let tcp = match connect_target(&host, port, &cfg).await {
+    let tcp = match route.connect(&host, port, &cfg).await {
         Ok(s) => {
             metrics::inc(&metrics::streams_connected);
             tracing::debug!(stream_id, host = %host, port, "connected");

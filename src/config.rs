@@ -1,7 +1,10 @@
 //! Runtime configuration, read from environment variables with sane defaults.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+
+use crate::route::{direct_routes, parse_routes, Route};
 
 /// Wisp per-stream flow-control window, in packets. The client may have at most this many
 /// unacked DATA packets in flight before it must wait for a CONTINUE. The per-stream intake
@@ -29,6 +32,8 @@ pub struct Config {
     pub block_private: bool,
     /// Hostnames containing any of these substrings are refused.
     pub host_blacklist: Vec<String>,
+    /// Named outbound routes selectable via `?route=`. Always contains `direct`.
+    pub routes: HashMap<String, Route>,
 }
 
 impl Default for Config {
@@ -45,6 +50,7 @@ impl Default for Config {
             max_streams: 256,
             block_private: false,
             host_blacklist: Vec::new(),
+            routes: direct_routes(),
         }
     }
 }
@@ -61,7 +67,10 @@ impl Config {
     /// - `MAX_STREAMS`: max concurrent streams per connection (default 256).
     /// - `BLOCK_PRIVATE`: `1`/`true` to refuse private-range targets (default off).
     /// - `HOST_BLACKLIST`: comma-separated hostname substrings to refuse.
-    pub fn from_env() -> Self {
+    /// - `ROUTES`: comma-separated `name=socks5://[user:pass@]host:port` upstream routes,
+    ///   selectable via `?route=<name>`. `direct` is implicit and reserved. A malformed
+    ///   spec is fatal (returns `Err`).
+    pub fn from_env() -> Result<Self, String> {
         let mut cfg = Config::default();
 
         if let Ok(bind) = std::env::var("BIND") {
@@ -114,8 +123,11 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        if let Ok(spec) = std::env::var("ROUTES") {
+            cfg.routes = parse_routes(&spec).map_err(|e| format!("invalid ROUTES: {e}"))?;
+        }
 
-        cfg
+        Ok(cfg)
     }
 
     /// Whether a hostname is refused by the blacklist (case-insensitive substring match).
@@ -209,6 +221,13 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn routes_default_has_direct_only() {
+        let cfg = Config::default();
+        assert!(cfg.routes.contains_key("direct"));
+        assert_eq!(cfg.routes.len(), 1);
     }
 
     #[test]

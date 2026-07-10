@@ -14,7 +14,13 @@ async fn main() {
         )
         .init();
 
-    let cfg = Arc::new(Config::from_env());
+    let cfg = match Config::from_env() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!("configuration error: {e}");
+            std::process::exit(1);
+        }
+    };
     let static_dir = cfg.static_dir.clone();
 
     warn_if_assets_missing(&static_dir);
