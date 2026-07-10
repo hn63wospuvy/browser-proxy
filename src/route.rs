@@ -217,17 +217,13 @@ fn build_route(spec: RouteSpec, name: &str) -> Result<Route, String> {
             address,
             ..
         } => {
-            use std::net::ToSocketAddrs;
             let cfg = crate::wireguard::WgConfig {
                 private_key: crate::wireguard::decode_key_b64(&private_key)
                     .map_err(|e| format!("wireguard route {name:?}: {e}"))?,
                 peer_public_key: crate::wireguard::decode_key_b64(&peer_public_key)
                     .map_err(|e| format!("wireguard route {name:?}: {e}"))?,
-                endpoint: endpoint
-                    .to_socket_addrs()
-                    .map_err(|_| format!("wireguard route {name:?}: bad endpoint"))?
-                    .next()
-                    .ok_or_else(|| format!("wireguard route {name:?}: endpoint unresolved"))?,
+                endpoint: crate::wireguard::resolve_v4_first(&endpoint)
+                    .map_err(|_| format!("wireguard route {name:?}: bad endpoint"))?,
                 address_v4: address
                     .split('/')
                     .next()

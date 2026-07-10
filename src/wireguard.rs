@@ -110,6 +110,21 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// Resolve `host:port`, preferring an IPv4 result. The tunnel's UDP socket to the WG peer is
+/// IPv4, so an IPv6 endpoint (which WARP's DNS often returns first) would be unreachable.
+pub fn resolve_v4_first(hostport: &str) -> Result<SocketAddr, String> {
+    let addrs: Vec<SocketAddr> = hostport
+        .to_socket_addrs()
+        .map_err(|e| format!("endpoint resolve: {e}"))?
+        .collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
+        .ok_or_else(|| "endpoint did not resolve".to_string())
+}
+
 /// Register a new WARP account (or load a cached one) and return full WG parameters.
 /// Blocking: called once at startup.
 pub fn register_warp(cache_path: &Path) -> Result<WgConfig, String> {
@@ -143,13 +158,28 @@ pub fn register_warp(cache_path: &Path) -> Result<WgConfig, String> {
         .into_string()
         .map_err(|e| format!("WARP registration read: {e}"))?;
 
+    // A fresh device registers with WARP disabled; the WireGuard endpoint won't answer
+    // handshakes until we PATCH warp_enabled=true (authorized by the returned token).
+    #[derive(Deserialize)]
+    struct RegIds {
+        id: String,
+        token: String,
+    }
+    let ids: RegIds =
+        serde_json::from_str(&text).map_err(|e| format!("reg id/token parse: {e}"))?;
+    ureq::request(
+        "PATCH",
+        &format!("https://api.cloudflareclient.com/v0a2158/reg/{}", ids.id),
+    )
+    .set("User-Agent", "okhttp/3.12.1")
+    .set("CF-Client-Version", "a-6.11-2223")
+    .set("Authorization", &format!("Bearer {}", ids.token))
+    .set("Content-Type", "application/json")
+    .send_string("{\"warp_enabled\": true}")
+    .map_err(|e| format!("WARP enable failed: {e}"))?;
+
     let partial = parse_registration(&text)?;
-    let endpoint = partial
-        .endpoint_hostport
-        .to_socket_addrs()
-        .map_err(|e| format!("endpoint resolve: {e}"))?
-        .next()
-        .ok_or("endpoint did not resolve")?;
+    let endpoint = resolve_v4_first(&partial.endpoint_hostport)?;
     let cfg = WgConfig {
         private_key: secret.to_bytes(),
         peer_public_key: decode_key_b64(&partial.peer_public_key_b64)?,
@@ -643,6 +673,7 @@ async fn driver(
                 }
             }
             _ = tick.tick() => {
+                // Drive boringtun timers: initial handshake, retransmits, keepalive, rekey.
                 if let TunnResult::WriteToNetwork(b) = tunn.update_timers(&mut scratch) {
                     let _ = udp.send(b).await;
                 }

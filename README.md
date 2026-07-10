@@ -129,6 +129,12 @@ query for the destination leaves this machine.
 - The **WARP registration API is unofficial** and may change; if `type: warp` stops
   registering, delete `warp-<name>.json` or switch to a `wgcf`-generated `type: wireguard`
   route.
+- A **freshly-registered WARP device can take a short while to activate** on Cloudflare's
+  edge, and rapidly registering many devices gets rate-limited (the WireGuard endpoint then
+  silently ignores handshakes). The credential cache means you normally register once, so
+  this only bites during repeated fresh registrations — delete `warp-<name>.json` only when
+  necessary, and if a new `warp` route won't connect, wait a minute and retry rather than
+  re-registering in a loop.
 - Embedding WireGuard roughly **doubles the dependency tree and build time** (`boringtun`,
   `smoltcp`, `ureq`, and their transitive crates). If you only need `socks5`/`http` routes,
   the tunnel is still compiled in.
