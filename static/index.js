@@ -6,6 +6,56 @@ const statusEl = document.getElementById("proxy-status");
 const errorEl = document.getElementById("proxy-error");
 const errorCode = document.getElementById("proxy-error-code");
 const frameHost = document.getElementById("frame-host");
+const routeSelect = document.getElementById("proxy-route");
+const ROUTE_KEY = "proxy-route";
+
+// Populate the route dropdown from the server. Hidden entirely when only `direct` exists,
+// so users without any VPN configured see no extra control.
+async function loadRoutes() {
+  let routes = ["direct"];
+  try {
+    const res = await fetch("/routes.json");
+    if (res.ok) {
+      const json = await res.json();
+      if (Array.isArray(json.routes) && json.routes.length) routes = json.routes;
+    }
+  } catch (_) {
+    /* fall back to direct-only */
+  }
+  if (routes.length <= 1) return; // only `direct`: leave the select hidden
+
+  routeSelect.replaceChildren();
+  for (const name of routes) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    routeSelect.appendChild(opt);
+  }
+  const saved = localStorage.getItem(ROUTE_KEY);
+  if (saved && routes.includes(saved)) routeSelect.value = saved;
+  routeSelect.hidden = false;
+}
+
+function currentRoute() {
+  return routeSelect && !routeSelect.hidden ? routeSelect.value : "direct";
+}
+
+loadRoutes();
+
+// Changing the route rebuilds the transport, which tears down the live WebSocket and every
+// stream on it. Re-navigate the frame to the last target so the page reloads over the new
+// route instead of dying half-loaded.
+routeSelect.addEventListener("change", async () => {
+  localStorage.setItem(ROUTE_KEY, routeSelect.value);
+  if (!frame || !document.body.classList.contains("browsing")) return;
+  try {
+    await ensureTransport();
+    const target = frame.__lastTarget;
+    if (target) frame.go(target);
+  } catch (err) {
+    console.error("route switch failed", err);
+  }
+});
 
 // Search engine used when the input is NOT a valid URL / IP / domain (see search.js).
 // Google aggressively CAPTCHAs proxied traffic (all requests share one IP + the libcurl-WASM
@@ -102,13 +152,22 @@ function injectFrameHotkey() {
 
 function wispUrl() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  return `${scheme}://${location.host}/wisp/`;
+  const route = currentRoute();
+  const q = route && route !== "direct" ? `?route=${encodeURIComponent(route)}` : "";
+  return `${scheme}://${location.host}/wisp/${q}`;
 }
 
-/** Point bare-mux at our Rust Wisp backend via the libcurl transport (idempotent). */
+/**
+ * Point bare-mux at our Wisp backend for the CURRENT route. Idempotent per URL: a route
+ * change alters the URL, which forces a fresh setTransport (rebuilding the SharedWorker
+ * transport and dropping the old WebSocket).
+ */
+let activeWispUrl = null;
 async function ensureTransport() {
-  if ((await connection.getTransport()) !== "/libcurl/index.mjs") {
-    await connection.setTransport("/libcurl/index.mjs", [{ websocket: wispUrl() }]);
+  const url = wispUrl();
+  if ((await connection.getTransport()) !== "/libcurl/index.mjs" || activeWispUrl !== url) {
+    await connection.setTransport("/libcurl/index.mjs", [{ websocket: url }]);
+    activeWispUrl = url;
   }
 }
 
@@ -135,6 +194,7 @@ form.addEventListener("submit", async (event) => {
     // Reveal the frame, hide the landing, then fade the bar out (with a hint).
     document.body.classList.add("browsing");
     statusEl.textContent = "";
+    frame.__lastTarget = target; // remembered so a route switch can reload this URL
     frame.go(target);
     setBarHidden(true);
   } catch (err) {

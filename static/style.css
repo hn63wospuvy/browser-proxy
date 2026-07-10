@@ -73,6 +73,21 @@ input:focus {
   border-color: var(--accent);
 }
 
+#proxy-route {
+  padding: 0.55rem 0.6rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+  cursor: pointer;
+}
+
+#proxy-route:focus {
+  border-color: var(--accent);
+}
+
 button {
   padding: 0.55rem 1.1rem;
   font-size: 0.95rem;
