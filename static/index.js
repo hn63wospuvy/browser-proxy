@@ -29,6 +29,57 @@ const connection = new BareMux.BareMuxConnection("/baremux/worker.js");
 // Reused across navigations so the transport/frame stay alive.
 let frame = null;
 
+// --- Top-bar visibility: hidden while browsing, toggled with Ctrl+Esc ---
+
+function toggleBar() {
+  const hidden = document.body.classList.toggle("bar-hidden");
+  if (!hidden) {
+    // Bar shown again: focus the URL box so a new destination can be typed.
+    address.focus();
+    address.select();
+  }
+}
+// Expose so the injected in-iframe listener can reach it via window.parent.
+window.__toggleBar = toggleBar;
+
+function isToggleKey(e) {
+  // Ctrl+Esc. (On Windows this may be intercepted by the OS Start menu.)
+  return e.ctrlKey && (e.key === "Escape" || e.code === "Escape");
+}
+
+function onHotkey(e) {
+  if (isToggleKey(e)) {
+    e.preventDefault();
+    // Only meaningful once we're actually browsing a site.
+    if (document.body.classList.contains("browsing")) toggleBar();
+  }
+}
+
+// Listen on the parent page (works when focus is outside the frame)...
+window.addEventListener("keydown", onHotkey, true);
+
+// ...and inside the frame on every load (the frame is same-origin, so the shortcut also
+// works while the user is interacting with the proxied page).
+function injectFrameHotkey() {
+  try {
+    const doc = frame.frame.contentDocument;
+    if (doc) {
+      doc.addEventListener(
+        "keydown",
+        (e) => {
+          if (e.ctrlKey && (e.key === "Escape" || e.code === "Escape")) {
+            e.preventDefault();
+            window.__toggleBar();
+          }
+        },
+        true
+      );
+    }
+  } catch (_) {
+    /* frame not same-origin accessible; parent-level listener still applies */
+  }
+}
+
 function wispUrl() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${location.host}/wisp/`;
@@ -58,9 +109,12 @@ form.addEventListener("submit", async (event) => {
     if (!frame) {
       frame = scramjet.createFrame();
       frame.frame.id = "sj-frame";
+      frame.frame.addEventListener("load", injectFrameHotkey);
       frameHost.appendChild(frame.frame);
     }
-    document.body.classList.add("browsing"); // reveal the frame, hide the landing
+    // Reveal the frame, hide the landing, and hide the top bar for an immersive view.
+    document.body.classList.add("browsing");
+    document.body.classList.add("bar-hidden");
     statusEl.textContent = "";
     frame.go(target);
   } catch (err) {

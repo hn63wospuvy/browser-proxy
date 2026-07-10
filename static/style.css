@@ -140,3 +140,8 @@ body.browsing #landing {
 body.browsing #frame-host {
   display: block;
 }
+
+/* Immersive mode: hide the top bar (toggle with Ctrl+Esc). The frame then fills the tab. */
+body.bar-hidden #bar {
+  display: none;
+}
