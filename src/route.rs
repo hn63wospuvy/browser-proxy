@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::config::{is_private_ip, Config};
+use crate::wireguard::{WgStream, WgTunnel};
 use crate::wisp::{R_BLOCKED, R_INVALID, R_REFUSED, R_TIMEOUT, R_UNREACHABLE};
 
 /// The reserved route name that always maps to a direct connection.
@@ -34,7 +35,8 @@ pub enum Route {
         addr: SocketAddr,
         auth: Option<(String, String)>,
     },
-    // `Wireguard(Arc<WgTunnel>)` is added in Phase 4 (embedded WireGuard).
+    /// Dial through an embedded WireGuard tunnel (shared, one per route).
+    Wireguard(Arc<WgTunnel>),
 }
 
 // Manual Debug: never render credentials. Only the variant + proxy address are shown.
@@ -44,15 +46,16 @@ impl std::fmt::Debug for Route {
             Route::Direct => write!(f, "Direct"),
             Route::Socks5 { addr, .. } => write!(f, "Socks5({addr})"),
             Route::Http { addr, .. } => write!(f, "Http({addr})"),
+            Route::Wireguard(_) => write!(f, "Wireguard"),
         }
     }
 }
 
-/// A connected upstream stream: a real TCP socket (direct/socks5/http) or, later, a virtual
-/// stream through a WireGuard tunnel. A delegating enum keeps the hot path free of `dyn`.
+/// A connected upstream stream: a real TCP socket (direct/socks5/http) or a virtual stream
+/// through a WireGuard tunnel. A delegating enum keeps the hot path free of `dyn`.
 pub enum Conn {
     Tcp(TcpStream),
-    // `Wg(WgStream)` is added in Phase 4.
+    Wg(WgStream),
 }
 
 impl AsyncRead for Conn {
@@ -63,6 +66,7 @@ impl AsyncRead for Conn {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Conn::Wg(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -75,16 +79,19 @@ impl AsyncWrite for Conn {
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Conn::Wg(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Conn::Wg(s) => Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Conn::Wg(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -119,8 +126,6 @@ enum RouteSpec {
         username: Option<String>,
         password: Option<String>,
     },
-    // Fields consumed in Phase 4 when the tunnel is built.
-    #[allow(dead_code)]
     Wireguard {
         name: String,
         private_key: String,
@@ -205,9 +210,38 @@ fn build_route(spec: RouteSpec, name: &str) -> Result<Route, String> {
                 auth: auth_pair(username, password),
             })
         }
-        // Phase 4 replaces these with a constructed Route::Wireguard(tunnel).
-        RouteSpec::Wireguard { .. } | RouteSpec::Warp { .. } => {
-            Err(format!("wireguard route {name:?} not supported yet (Phase 4)"))
+        RouteSpec::Wireguard {
+            private_key,
+            peer_public_key,
+            endpoint,
+            address,
+            ..
+        } => {
+            use std::net::ToSocketAddrs;
+            let cfg = crate::wireguard::WgConfig {
+                private_key: crate::wireguard::decode_key_b64(&private_key)
+                    .map_err(|e| format!("wireguard route {name:?}: {e}"))?,
+                peer_public_key: crate::wireguard::decode_key_b64(&peer_public_key)
+                    .map_err(|e| format!("wireguard route {name:?}: {e}"))?,
+                endpoint: endpoint
+                    .to_socket_addrs()
+                    .map_err(|_| format!("wireguard route {name:?}: bad endpoint"))?
+                    .next()
+                    .ok_or_else(|| format!("wireguard route {name:?}: endpoint unresolved"))?,
+                address_v4: address
+                    .split('/')
+                    .next()
+                    .unwrap_or(&address)
+                    .parse()
+                    .map_err(|_| format!("wireguard route {name:?}: bad address"))?,
+            };
+            Ok(Route::Wireguard(WgTunnel::spawn(cfg)))
+        }
+        RouteSpec::Warp { .. } => {
+            let cache = std::path::PathBuf::from(format!("warp-{name}.json"));
+            let cfg = crate::wireguard::register_warp(&cache)
+                .map_err(|e| format!("warp route {name:?}: {e}"))?;
+            Ok(Route::Wireguard(WgTunnel::spawn(cfg)))
         }
     }
 }
@@ -224,6 +258,10 @@ impl Route {
             Route::Http { addr, auth } => connect_http(*addr, auth.as_ref(), host, port, cfg)
                 .await
                 .map(Conn::Tcp),
+            Route::Wireguard(tunnel) => tunnel
+                .dial(host, port, cfg.connect_timeout)
+                .await
+                .map(Conn::Wg),
         }
     }
 }
@@ -534,6 +572,7 @@ mod tests {
         match r {
             Route::Socks5 { addr, .. } | Route::Http { addr, .. } => addr.to_string(),
             Route::Direct => "direct".into(),
+            Route::Wireguard(_) => "wireguard".into(),
         }
     }
 
