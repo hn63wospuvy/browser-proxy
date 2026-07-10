@@ -1,5 +1,12 @@
-# Routes selectable from the UI. `direct` (no proxy) always exists implicitly.
 # Point the server at this file with CONFIG=config.yaml (the default path).
+
+# Where the HTTP/WebSocket server listens. Both fields are optional; omit `bind` entirely to
+# keep the loopback-only default (127.0.0.1:8080). The BIND / PORT env vars override this.
+bind:
+  interface: "127.0.0.1"   # IP to bind: 127.0.0.1 (loopback) or 0.0.0.0 to expose on the LAN
+  port: 8080
+
+# Routes selectable from the UI. `direct` (no proxy) always exists implicitly.
 routes:
   # Cloudflare WARP, registered in-process (one binary, no warp-cli):
   - name: warp

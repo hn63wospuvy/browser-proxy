@@ -58,7 +58,7 @@ Then open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press
 | `MAX_STREAMS` | `256` | Max concurrent streams per connection (further CONNECTs get refused). |
 | `BLOCK_PRIVATE` | `0` | `1`/`true` refuses targets on private/loopback/link-local IPs (SSRF guard). |
 | `HOST_BLACKLIST` | *(empty)* | Comma-separated hostname substrings to refuse. |
-| `CONFIG` | `config.yaml` | Path to the YAML route config (see below). The default path being absent is fine (routes = `direct` only); an explicitly-set but missing/malformed config aborts startup. |
+| `CONFIG` | `config.yaml` | Path to the YAML config (bind address + routes, see below). The default path being absent is fine (routes = `direct` only); an explicitly-set but missing/malformed config aborts startup. `BIND`/`PORT` override the file's `bind`. |
 | `RUST_LOG` | `browser_proxy=info` | Log filter (`tower_http=debug` to log every request). |
 
 ## Routing through a VPN
@@ -69,7 +69,13 @@ the server's. Routes are defined in a YAML config file (`config.yaml` by default
 `CONFIG`). `direct` (no proxy) always exists; the dropdown is hidden when no other route is
 configured. See [`config.example.yaml`](config.example.yaml).
 
+The same file also sets the **bind address** (optional; `BIND`/`PORT` env vars override it):
+
 ```yaml
+bind:
+  interface: "127.0.0.1"   # 127.0.0.1 (loopback) or 0.0.0.0 to expose on the LAN
+  port: 8080
+
 routes:
   # Cloudflare WARP, registered in-process (one binary, no warp-cli / wireproxy):
   - name: warp

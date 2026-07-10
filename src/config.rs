@@ -68,11 +68,35 @@ impl Config {
     /// - `MAX_STREAMS`: max concurrent streams per connection (default 256).
     /// - `BLOCK_PRIVATE`: `1`/`true` to refuse private-range targets (default off).
     /// - `HOST_BLACKLIST`: comma-separated hostname substrings to refuse.
-    /// - `CONFIG`: path to a YAML route config (default `config.yaml` if present). See
-    ///   `config.example.yaml`. Routes are selectable via `?route=<name>`; `direct` is
-    ///   implicit and reserved. A malformed config is fatal (returns `Err`).
+    /// - `CONFIG`: path to a YAML config (default `config.yaml` if present). See
+    ///   `config.example.yaml`. Holds the `bind` address (`interface` + `port`) and the
+    ///   `routes` list. `BIND`/`PORT` env vars override the file's `bind`. A malformed config
+    ///   is fatal (returns `Err`).
     pub fn from_env() -> Result<Self, String> {
         let mut cfg = Config::default();
+
+        // Load the YAML config file first (bind address + routes); the env vars below then
+        // override whatever it set, so env always wins.
+        let path = std::env::var("CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
+        let body = match std::fs::read_to_string(&path) {
+            Ok(b) => Some(b),
+            // The default file being absent is fine; an explicitly-set CONFIG that is missing
+            // is an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::env::var("CONFIG").is_ok() {
+                    return Err(format!("{path}: {e}"));
+                }
+                None
+            }
+            Err(e) => return Err(format!("{path}: {e}")),
+        };
+        if let Some(body) = &body {
+            if let Some(bind) = parse_bind(body).map_err(|e| format!("{path}: {e}"))? {
+                cfg.bind = bind;
+            }
+            cfg.routes =
+                crate::route::routes_from_yaml(body).map_err(|e| format!("{path}: {e}"))?;
+        }
 
         if let Ok(bind) = std::env::var("BIND") {
             if let Ok(addr) = bind.parse::<SocketAddr>() {
@@ -124,23 +148,6 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
-        // Routes come from a YAML config file (the env var ROUTES was removed).
-        let path = std::env::var("CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
-        match std::fs::read_to_string(&path) {
-            Ok(body) => {
-                cfg.routes =
-                    crate::route::routes_from_yaml(&body).map_err(|e| format!("{path}: {e}"))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // No config file: direct only. Only an explicitly-set CONFIG that is missing
-                // is an error; the default path being absent is fine.
-                if std::env::var("CONFIG").is_ok() {
-                    return Err(format!("{path}: {e}"));
-                }
-            }
-            Err(e) => return Err(format!("{path}: {e}")),
-        }
-
         Ok(cfg)
     }
 
@@ -149,6 +156,40 @@ impl Config {
         let host = host.to_ascii_lowercase();
         self.host_blacklist.iter().any(|b| host.contains(b))
     }
+}
+
+/// The optional `bind:` section of the config file.
+#[derive(serde::Deserialize)]
+struct BindFile {
+    bind: Option<BindSpec>,
+}
+#[derive(serde::Deserialize)]
+struct BindSpec {
+    /// IP address to bind (e.g. `127.0.0.1`, `0.0.0.0`). Defaults to the default interface.
+    interface: Option<String>,
+    /// Port to bind. Defaults to the default port.
+    port: Option<u16>,
+}
+
+/// Parse the `bind` address from the config file, if present. Starts from the default bind
+/// and overrides the interface / port that the file specifies.
+fn parse_bind(yaml: &str) -> Result<Option<SocketAddr>, String> {
+    let f: BindFile =
+        serde_yaml_ng::from_str(yaml).map_err(|e| format!("config parse error: {e}"))?;
+    let Some(spec) = f.bind else {
+        return Ok(None);
+    };
+    let mut addr = Config::default().bind;
+    if let Some(iface) = spec.interface {
+        let ip: IpAddr = iface
+            .parse()
+            .map_err(|_| format!("bind.interface must be an IP address, got {iface:?}"))?;
+        addr.set_ip(ip);
+    }
+    if let Some(port) = spec.port {
+        addr.set_port(port);
+    }
+    Ok(Some(addr))
 }
 
 fn parse_env_u32(key: &str) -> Option<u32> {
@@ -242,6 +283,25 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.routes.contains_key("direct"));
         assert_eq!(cfg.routes.len(), 1);
+    }
+
+    #[test]
+    fn bind_parsed_from_config() {
+        assert_eq!(parse_bind("routes: []").unwrap(), None);
+        let both = parse_bind("bind:\n  interface: \"0.0.0.0\"\n  port: 9000\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(both.to_string(), "0.0.0.0:9000");
+        // Only a port: keep the default interface (127.0.0.1).
+        let port_only = parse_bind("bind:\n  port: 9000\n").unwrap().unwrap();
+        assert_eq!(port_only.to_string(), "127.0.0.1:9000");
+        // Only an interface: keep the default port (8080).
+        let iface_only = parse_bind("bind:\n  interface: \"0.0.0.0\"\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(iface_only.to_string(), "0.0.0.0:8080");
+        // Bad interface is fatal.
+        assert!(parse_bind("bind:\n  interface: \"not-an-ip\"\n").is_err());
     }
 
     #[test]
