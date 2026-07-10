@@ -7,12 +7,19 @@
 //! - one **writer task** owns the WS sink; every stream sends outgoing packets through a
 //!   bounded channel to it (serializes writes, gives backpressure to slow clients);
 //! - one **read loop** owns the WS stream and the stream table (single owner → no lock).
-//!   It routes DATA to per-stream channels, and reaps finished streams via a `done` channel;
-//! - one **stream task** per stream owns its TCP socket and relays both directions, sending
-//!   CONTINUE packets as it drains client data to implement the flow-control window.
+//!   It routes DATA to per-stream channels, reaps finished streams via a `done` channel,
+//!   and enforces the advertised flow-control window;
+//! - one **stream task** per stream owns its TCP socket and relays both directions.
+//!
+//! Flow control: each stream's intake channel is **bounded** to `buffer_size`. The server
+//! advertises the *actual* free space (`buffer_size - outstanding`) in every CONTINUE, so a
+//! conforming client never overruns it. A client that ignores its window overflows the
+//! bounded channel; that is a protocol violation and the stream is closed. Either way,
+//! per-stream memory is hard-capped — it can never grow without bound.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -21,6 +28,7 @@ use futures_util::{sink::SinkExt, stream::StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::config::{is_private_ip, Config};
 
@@ -30,9 +38,8 @@ const T_DATA: u8 = 0x02;
 const T_CONTINUE: u8 = 0x03;
 const T_CLOSE: u8 = 0x04;
 
-// Stream types (CONNECT payload).
+// Stream type (CONNECT payload). Only TCP is supported; UDP (0x02) is refused.
 const ST_TCP: u8 = 0x01;
-const ST_UDP: u8 = 0x02;
 
 // Close reasons.
 const R_VOLUNTARY: u8 = 0x02;
@@ -124,8 +131,11 @@ fn close_packet(stream_id: u32, reason: u8) -> Message {
 
 /// Table entry for a live stream, held only by the read loop.
 struct StreamHandle {
-    data_tx: mpsc::UnboundedSender<Bytes>,
+    data_tx: mpsc::Sender<Bytes>,
     abort: tokio::task::AbortHandle,
+    /// Packets accepted but not yet drained to TCP. Shared with the stream task, which
+    /// decrements it; the read loop increments it. Drives the advertised credit.
+    outstanding: Arc<AtomicU32>,
 }
 
 /// Entry point: drive one Wisp connection to completion.
@@ -184,11 +194,17 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
                         if streams.contains_key(&stream_id) {
                             continue;
                         }
-                        if stream_type == ST_UDP {
+                        // Cap concurrent streams per connection.
+                        if streams.len() >= cfg.max_streams {
+                            let _ = ws_tx.send(close_packet(stream_id, R_REFUSED)).await;
+                            continue;
+                        }
+                        if stream_type != ST_TCP {
+                            // UDP (0x02) is not supported; anything else is invalid.
                             let _ = ws_tx.send(close_packet(stream_id, R_INVALID)).await;
                             continue;
                         }
-                        if stream_type != ST_TCP || host.len() > MAX_HOST_LEN {
+                        if host.len() > MAX_HOST_LEN {
                             let _ = ws_tx.send(close_packet(stream_id, R_INVALID)).await;
                             continue;
                         }
@@ -200,7 +216,8 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
                             }
                         };
 
-                        let (data_tx, data_rx) = mpsc::unbounded_channel::<Bytes>();
+                        let (data_tx, data_rx) = mpsc::channel::<Bytes>(cfg.buffer_size as usize);
+                        let outstanding = Arc::new(AtomicU32::new(0));
                         let jh = tokio::spawn(run_stream(
                             stream_id,
                             host,
@@ -209,14 +226,45 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
                             ws_tx.clone(),
                             done_tx.clone(),
                             cfg.clone(),
+                            outstanding.clone(),
                         ));
-                        streams.insert(stream_id, StreamHandle { data_tx, abort: jh.abort_handle() });
+                        streams.insert(
+                            stream_id,
+                            StreamHandle { data_tx, abort: jh.abort_handle(), outstanding },
+                        );
                     }
                     Packet::Data { stream_id, payload } => {
-                        if let Some(h) = streams.get(&stream_id) {
-                            // Unbounded, non-blocking send: never head-of-line-blocks other
-                            // streams. Memory is bounded by the CONTINUE credit window.
-                            let _ = h.data_tx.send(Bytes::copy_from_slice(payload));
+                        // Decide the outcome first so we don't hold an immutable borrow of
+                        // `streams` while mutating it.
+                        let outcome = if let Some(h) = streams.get(&stream_id) {
+                            // Increment before enqueue so the stream task's decrement (after
+                            // it drains the item) can never run before this add.
+                            h.outstanding.fetch_add(1, Ordering::AcqRel);
+                            match h.data_tx.try_send(Bytes::copy_from_slice(payload)) {
+                                Ok(()) => Outcome::Ok,
+                                Err(TrySendError::Full(_)) => {
+                                    h.outstanding.fetch_sub(1, Ordering::AcqRel);
+                                    Outcome::WindowViolation
+                                }
+                                Err(TrySendError::Closed(_)) => {
+                                    h.outstanding.fetch_sub(1, Ordering::AcqRel);
+                                    Outcome::Stale
+                                }
+                            }
+                        } else {
+                            Outcome::Unknown
+                        };
+                        match outcome {
+                            Outcome::WindowViolation => {
+                                let _ = ws_tx.send(close_packet(stream_id, R_INVALID)).await;
+                                if let Some(h) = streams.remove(&stream_id) {
+                                    h.abort.abort();
+                                }
+                            }
+                            Outcome::Stale => {
+                                streams.remove(&stream_id);
+                            }
+                            Outcome::Ok | Outcome::Unknown => {}
                         }
                     }
                     Packet::Close { stream_id } => {
@@ -235,6 +283,13 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
         h.abort.abort();
     }
     writer.abort();
+}
+
+enum Outcome {
+    Ok,
+    WindowViolation,
+    Stale,
+    Unknown,
 }
 
 /// Resolve + connect to the target, honoring the SSRF guard and blacklist.
@@ -276,14 +331,16 @@ async fn connect_target(host: &str, port: u16, cfg: &Config) -> Result<TcpStream
 }
 
 /// Relay one stream: connect, then pump both directions until either side ends.
+#[allow(clippy::too_many_arguments)]
 async fn run_stream(
     stream_id: u32,
     host: String,
     port: u16,
-    mut data_rx: mpsc::UnboundedReceiver<Bytes>,
+    mut data_rx: mpsc::Receiver<Bytes>,
     ws_tx: mpsc::Sender<Message>,
     done_tx: mpsc::UnboundedSender<u32>,
     cfg: Arc<Config>,
+    outstanding: Arc<AtomicU32>,
 ) {
     let tcp = match connect_target(&host, port, &cfg).await {
         Ok(s) => s,
@@ -296,28 +353,32 @@ async fn run_stream(
 
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
-    // How many packets to drain before topping the client's credit back up. Half the window
-    // keeps the pipe full without letting more than ~buffer_size packets sit in flight.
-    let refill_at = (cfg.buffer_size / 2).max(1);
-    let credit = cfg.buffer_size;
+    let buffer_size = cfg.buffer_size;
+    // Replenish the window after draining half of it: keeps the pipe full without stalls.
+    let refill_at = (buffer_size / 2).max(1);
+    let idle_timeout = cfg.idle_timeout;
 
     // Dedicated clones so each direction owns its sender; `ws_tx` stays for the final CLOSE.
     let ws_tx_cont = ws_tx.clone();
     let ws_tx_data = ws_tx.clone();
 
-    // client → TCP: write request bytes, replenish credit as we drain.
+    // client → TCP: write request bytes; credit the client back with the ACTUAL free space.
     let client_to_tcp = async move {
-        let mut processed: u32 = 0;
+        let mut drained_since = 0u32;
         while let Some(chunk) = data_rx.recv().await {
             if tcp_write.write_all(&chunk).await.is_err() {
                 break;
             }
-            processed += 1;
-            if processed >= refill_at {
-                processed = 0;
-                // Backpressure: if the writer queue is full the client is slow, so blocking
-                // here (and thus not crediting more) is the desired throttle.
-                if ws_tx_cont.send(continue_packet(stream_id, credit)).await.is_err() {
+            outstanding.fetch_sub(1, Ordering::AcqRel);
+            drained_since += 1;
+            if drained_since >= refill_at {
+                drained_since = 0;
+                let credit = buffer_size.saturating_sub(outstanding.load(Ordering::Acquire));
+                if ws_tx_cont
+                    .send(continue_packet(stream_id, credit))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -325,15 +386,27 @@ async fn run_stream(
         let _ = tcp_write.shutdown().await;
     };
 
-    // TCP → client: stream response bytes back as DATA packets.
+    // TCP → client: stream response bytes back as DATA packets, with an optional idle timer.
     let tcp_to_client = async move {
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
-            match tcp_read.read(&mut buf).await {
-                Ok(0) => return R_VOLUNTARY,          // server closed cleanly
+            let read = tcp_read.read(&mut buf);
+            let n = match idle_timeout {
+                Some(to) => match tokio::time::timeout(to, read).await {
+                    Ok(r) => r,
+                    Err(_) => return R_TIMEOUT, // no traffic from the target for too long
+                },
+                None => read.await,
+            };
+            match n {
+                Ok(0) => return R_VOLUNTARY, // server closed cleanly
                 Ok(n) => {
-                    if ws_tx_data.send(data_packet(stream_id, &buf[..n])).await.is_err() {
-                        return R_NETWORK;             // client gone
+                    if ws_tx_data
+                        .send(data_packet(stream_id, &buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        return R_NETWORK; // client gone
                     }
                 }
                 Err(_) => return R_NETWORK,
@@ -342,8 +415,7 @@ async fn run_stream(
     };
 
     // Whichever direction ends first ends the stream. The response direction decides the
-    // close reason sent to the client; the request direction ending just means no more
-    // request body, so we keep the reason neutral.
+    // close reason; the request direction ending just means no more request body.
     let reason = tokio::select! {
         _ = client_to_tcp => R_VOLUNTARY,
         r = tcp_to_client => r,

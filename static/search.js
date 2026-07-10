@@ -13,14 +13,18 @@
  */
 function search(input, template) {
   try {
-    return new URL(input).toString();
+    const u = new URL(input);
+    // Only accept a real web URL. "example.com:8080" also parses as a URL whose scheme is
+    // "example.com:", so gate on http/https to avoid passing that through unproxied.
+    if (u.protocol === "http:" || u.protocol === "https:") return u.toString();
   } catch (_) {
     /* not a full URL */
   }
 
   try {
     const url = new URL(`https://${input}`);
-    if (url.hostname.includes(".")) return url.toString();
+    // A bare host, with or without a port: "example.com", "localhost:3000".
+    if (url.hostname.includes(".") || url.port) return url.toString();
   } catch (_) {
     /* not a bare host either */
   }

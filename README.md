@@ -48,11 +48,14 @@ Then open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BIND` | `0.0.0.0:8080` | Full bind address. |
+| `BIND` | `127.0.0.1:8080` | Full bind address. Loopback-only by default; set e.g. `0.0.0.0:8080` to expose it. |
 | `PORT` | `8080` | Overrides just the port. |
 | `STATIC_DIR` | `static` | Directory of the frontend + vendored assets. |
-| `WISP_BUFFER_SIZE` | `128` | Wisp flow-control window (packets per stream). |
+| `WISP_BUFFER_SIZE` | `128` | Wisp flow-control window (packets per stream); also the per-stream memory bound. |
 | `CONNECT_TIMEOUT_SECS` | `15` | Outbound TCP connect timeout. |
+| `IDLE_TIMEOUT_SECS` | `0` | Reap a stream whose target is silent this long. `0` disables it (keeps SSE/long-poll alive). |
+| `MAX_CONNECTIONS` | `128` | Max concurrent Wisp WebSocket connections (further upgrades get 503). |
+| `MAX_STREAMS` | `256` | Max concurrent streams per connection (further CONNECTs get refused). |
 | `BLOCK_PRIVATE` | `0` | `1`/`true` refuses targets on private/loopback/link-local IPs (SSRF guard). |
 | `HOST_BLACKLIST` | *(empty)* | Comma-separated hostname substrings to refuse. |
 | `RUST_LOG` | `browser_proxy=info` | Log filter (`tower_http=debug` to log every request). |
@@ -92,7 +95,9 @@ cargo test -- --ignored         # also runs the real-internet relay test (needs 
 ## Scope & limitations
 
 - **Personal / small internal use.** No authentication, a shared process, no per-user
-  isolation — by design. Do not expose it publicly without adding auth + `BLOCK_PRIVATE=1`.
+  isolation — by design. It binds **loopback only** by default and caps concurrent
+  connections/streams and per-stream memory, but it is still an open outbound relay: do not
+  expose it publicly (`BIND=0.0.0.0`) without adding auth and setting `BLOCK_PRIVATE=1`.
 - **TCP only.** UDP/QUIC Wisp streams are refused; browsers fall back to TCP HTTP, which is
   what the libcurl transport uses anyway.
 - **Very heavy / DRM sites** (e.g. YouTube with Widevine) may not fully work — that is a

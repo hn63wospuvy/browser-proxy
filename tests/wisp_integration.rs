@@ -188,7 +188,7 @@ async fn wisp_close_on_refused_connection() {
                 assert_eq!(u32_le(&frame[1..5]), 7);
                 let reason = frame[5];
                 assert!(
-                    matches!(reason, 0x42 | 0x43 | 0x44),
+                    matches!(reason, 0x42..=0x44),
                     "expected an unreachable/timeout/refused reason, got {reason:#x}"
                 );
                 break;

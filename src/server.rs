@@ -6,9 +6,11 @@ use std::sync::Arc;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::State;
 use axum::http::header::{HeaderName, HeaderValue, CACHE_CONTROL};
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use tokio::sync::Semaphore;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
@@ -16,11 +18,27 @@ use tower_http::trace::TraceLayer;
 use crate::config::Config;
 use crate::wisp;
 
+/// Cap on a single WebSocket message / frame. Wisp DATA frames from the real client are
+/// ~16 KiB; this stops a hostile client from sending a single multi-MiB frame.
+const MAX_WS_MESSAGE: usize = 1024 * 1024;
+
+#[derive(Clone)]
+struct AppState {
+    cfg: Arc<Config>,
+    /// Limits concurrent Wisp connections; a permit is held for each connection's lifetime.
+    conn_sem: Arc<Semaphore>,
+}
+
 /// Assemble routes: `/wisp/` WebSocket, the three vendored asset trees, and the frontend
 /// as the fallback. Cross-origin-isolation headers are attached to every response.
 pub fn build_router(cfg: Arc<Config>, static_dir: &str) -> Router {
     let sd = |sub: &str| {
         ServeDir::new(Path::new(static_dir).join(sub)).append_index_html_on_directories(false)
+    };
+
+    let state = AppState {
+        conn_sem: Arc::new(Semaphore::new(cfg.max_connections)),
+        cfg,
     };
 
     Router::new()
@@ -39,7 +57,7 @@ pub fn build_router(cfg: Arc<Config>, static_dir: &str) -> Router {
             HeaderValue::from_static("no-cache"),
         ))
         .layer(TraceLayer::new_for_http())
-        .with_state(cfg)
+        .with_state(state)
 }
 
 /// A layer that unconditionally sets `name: value` on every response.
@@ -50,8 +68,23 @@ fn header_layer(name: &'static str, value: &'static str) -> SetResponseHeaderLay
     )
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(cfg): State<Arc<Config>>) -> Response {
-    ws.on_upgrade(move |socket| wisp::handle_connection(socket, cfg))
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    // Reject the upgrade if we're already at the connection cap.
+    let permit = match state.conn_sem.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "too many connections").into_response();
+        }
+    };
+
+    let cfg = state.cfg.clone();
+    ws.max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| async move {
+            // Hold the permit for the whole connection; released when this future ends.
+            let _permit = permit;
+            wisp::handle_connection(socket, cfg).await;
+        })
 }
 
 /// Log a clear hint if the vendored client assets have not been fetched yet.
