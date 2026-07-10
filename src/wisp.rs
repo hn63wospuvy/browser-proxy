@@ -312,7 +312,7 @@ async fn run_stream(
     route: Arc<Route>,
     outstanding: Arc<AtomicU32>,
 ) {
-    let tcp = match route.connect(&host, port, &cfg).await {
+    let conn = match route.connect(&host, port, &cfg).await {
         Ok(s) => {
             metrics::inc(&metrics::streams_connected);
             tracing::debug!(stream_id, host = %host, port, "connected");
@@ -327,7 +327,8 @@ async fn run_stream(
         }
     };
 
-    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+    // `Conn` may be a real TCP socket or a virtual WireGuard stream; split generically.
+    let (mut tcp_read, mut tcp_write) = tokio::io::split(conn);
 
     let buffer_size = cfg.buffer_size;
     // Replenish the window after draining half of it: keeps the pipe full without stalls.

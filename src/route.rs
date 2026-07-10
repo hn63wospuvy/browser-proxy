@@ -1,13 +1,17 @@
-//! Outbound routing: send a stream's TCP either directly or through a SOCKS5 upstream (a VPN
-//! exposed as a proxy — WARP `mode proxy`, Tor, …). One `Route` per Wisp connection.
+//! Outbound routing: send a stream's TCP either directly, through a SOCKS5 / HTTP proxy, or
+//! (later) through an embedded WireGuard tunnel. One `Route` per Wisp connection.
 //!
 //! Fail closed: selection and dialing never silently fall back to `Direct`. An unknown route
-//! is rejected before the WebSocket upgrade; a dead proxy closes the stream.
+//! is rejected before the WebSocket upgrade; a dead upstream closes the stream.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::config::{is_private_ip, Config};
@@ -17,7 +21,6 @@ use crate::wisp::{R_BLOCKED, R_INVALID, R_REFUSED, R_TIMEOUT, R_UNREACHABLE};
 pub const DIRECT: &str = "direct";
 
 /// How a stream's outbound TCP is established.
-#[derive(Clone, Debug)]
 pub enum Route {
     /// Resolve locally and connect straight out (today's behavior).
     Direct,
@@ -26,75 +29,201 @@ pub enum Route {
         addr: SocketAddr,
         auth: Option<(String, String)>,
     },
+    /// Dial through an HTTP proxy via the CONNECT method. `auth` is optional Basic credentials.
+    Http {
+        addr: SocketAddr,
+        auth: Option<(String, String)>,
+    },
+    // `Wireguard(Arc<WgTunnel>)` is added in Phase 4 (embedded WireGuard).
 }
 
-/// The route map used when `ROUTES` is unset: only `direct` exists.
-pub fn direct_routes() -> HashMap<String, Route> {
+// Manual Debug: never render credentials. Only the variant + proxy address are shown.
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Route::Direct => write!(f, "Direct"),
+            Route::Socks5 { addr, .. } => write!(f, "Socks5({addr})"),
+            Route::Http { addr, .. } => write!(f, "Http({addr})"),
+        }
+    }
+}
+
+/// A connected upstream stream: a real TCP socket (direct/socks5/http) or, later, a virtual
+/// stream through a WireGuard tunnel. A delegating enum keeps the hot path free of `dyn`.
+pub enum Conn {
+    Tcp(TcpStream),
+    // `Wg(WgStream)` is added in Phase 4.
+}
+
+impl AsyncRead for Conn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Conn::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Conn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Conn::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Conn::Tcp(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Conn::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// The route map used when no config file is present: only `direct` exists.
+pub fn direct_routes() -> HashMap<String, Arc<Route>> {
     let mut m = HashMap::new();
-    m.insert(DIRECT.to_string(), Route::Direct);
+    m.insert(DIRECT.to_string(), Arc::new(Route::Direct));
     m
 }
 
-/// Parse the `ROUTES` env spec: `name=socks5://[user:pass@]host:port`, comma-separated.
-/// Returns a map that always includes the implicit `direct` route. Any malformed entry,
-/// unknown scheme, duplicate name, or use of the reserved name `direct` is an error — the
-/// caller treats that as fatal.
-pub fn parse_routes(spec: &str) -> Result<HashMap<String, Route>, String> {
-    let mut map = direct_routes();
-    for entry in spec.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
+/// A `config.yaml` body.
+#[derive(Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    routes: Vec<RouteSpec>,
+}
+
+/// One route entry as written in YAML, tagged by `type`.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum RouteSpec {
+    Socks5 {
+        name: String,
+        address: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    Http {
+        name: String,
+        address: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    // Fields consumed in Phase 4 when the tunnel is built.
+    #[allow(dead_code)]
+    Wireguard {
+        name: String,
+        private_key: String,
+        peer_public_key: String,
+        endpoint: String,
+        address: String,
+    },
+    Warp {
+        name: String,
+    },
+}
+
+impl RouteSpec {
+    fn name(&self) -> &str {
+        match self {
+            RouteSpec::Socks5 { name, .. }
+            | RouteSpec::Http { name, .. }
+            | RouteSpec::Wireguard { name, .. }
+            | RouteSpec::Warp { name } => name,
         }
-        let (name, url) = entry
-            .split_once('=')
-            .ok_or_else(|| format!("route entry missing '=': {entry:?}"))?;
-        let name = name.trim();
-        let url = url.trim();
+    }
+}
+
+fn auth_pair(u: Option<String>, p: Option<String>) -> Option<(String, String)> {
+    match (u, p) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    }
+}
+
+/// Parse a `config.yaml` body into the route map (always including the implicit `direct`).
+/// Any malformed entry, unknown `type`, duplicate name, or use of the reserved name `direct`
+/// is an error — the caller treats that as fatal. `wireguard`/`warp` specs build (and, for
+/// `warp`, register) a tunnel eagerly, so this may block and must run inside the tokio runtime.
+pub fn routes_from_yaml(yaml: &str) -> Result<HashMap<String, Arc<Route>>, String> {
+    let cfg: ConfigFile =
+        serde_yaml_ng::from_str(yaml).map_err(|e| format!("config parse error: {e}"))?;
+    let mut map = direct_routes();
+    for spec in cfg.routes {
+        let name = spec.name().to_string();
         if name.is_empty() {
-            return Err(format!("route entry has empty name: {entry:?}"));
+            return Err("route with empty name".into());
         }
         if name == DIRECT {
             return Err(format!("route name {DIRECT:?} is reserved"));
         }
-        let route = parse_socks5_url(url)?;
-        if map.insert(name.to_string(), route).is_some() {
+        let route = build_route(spec, &name)?;
+        if map.insert(name.clone(), Arc::new(route)).is_some() {
             return Err(format!("duplicate route name: {name:?}"));
         }
     }
     Ok(map)
 }
 
-/// Parse `socks5://[user:pass@]host:port` into a `Route::Socks5`.
-fn parse_socks5_url(url: &str) -> Result<Route, String> {
-    let rest = url
-        .strip_prefix("socks5://")
-        .ok_or_else(|| format!("unsupported route scheme (expected socks5://): {url:?}"))?;
-    // Split optional `user:pass@` credentials from the `host:port` authority.
-    let (auth, authority) = match rest.rsplit_once('@') {
-        Some((creds, hostport)) => {
-            let (u, p) = creds
-                .split_once(':')
-                .ok_or_else(|| format!("credentials must be user:pass in {url:?}"))?;
-            (Some((u.to_string(), p.to_string())), hostport)
+fn build_route(spec: RouteSpec, name: &str) -> Result<Route, String> {
+    match spec {
+        RouteSpec::Socks5 {
+            address,
+            username,
+            password,
+            ..
+        } => {
+            let addr = address
+                .parse()
+                .map_err(|_| format!("socks5 route {name:?}: address must be ip:port"))?;
+            Ok(Route::Socks5 {
+                addr,
+                auth: auth_pair(username, password),
+            })
         }
-        None => (None, rest),
-    };
-    let addr: SocketAddr = authority
-        .parse()
-        .map_err(|_| format!("route address must be ip:port, got {authority:?}"))?;
-    Ok(Route::Socks5 { addr, auth })
+        RouteSpec::Http {
+            address,
+            username,
+            password,
+            ..
+        } => {
+            let addr = address
+                .parse()
+                .map_err(|_| format!("http route {name:?}: address must be ip:port"))?;
+            Ok(Route::Http {
+                addr,
+                auth: auth_pair(username, password),
+            })
+        }
+        // Phase 4 replaces these with a constructed Route::Wireguard(tunnel).
+        RouteSpec::Wireguard { .. } | RouteSpec::Warp { .. } => {
+            Err(format!("wireguard route {name:?} not supported yet (Phase 4)"))
+        }
+    }
 }
 
 impl Route {
-    /// Open a connected TCP stream to `host:port` according to this route.
+    /// Open a connected stream to `host:port` according to this route.
     /// On failure returns a Wisp close reason.
-    pub async fn connect(&self, host: &str, port: u16, cfg: &Config) -> Result<TcpStream, u8> {
+    pub async fn connect(&self, host: &str, port: u16, cfg: &Config) -> Result<Conn, u8> {
         match self {
-            Route::Direct => connect_direct(host, port, cfg).await,
-            Route::Socks5 { addr, auth } => {
-                connect_socks5(*addr, auth.as_ref(), host, port, cfg).await
-            }
+            Route::Direct => connect_direct(host, port, cfg).await.map(Conn::Tcp),
+            Route::Socks5 { addr, auth } => connect_socks5(*addr, auth.as_ref(), host, port, cfg)
+                .await
+                .map(Conn::Tcp),
+            Route::Http { addr, auth } => connect_http(*addr, auth.as_ref(), host, port, cfg)
+                .await
+                .map(Conn::Tcp),
         }
     }
 }
@@ -294,67 +423,204 @@ async fn socks5_handshake(
     Ok(sock)
 }
 
+// --- HTTP proxy (CONNECT) ---
+
+/// Minimal RFC 4648 base64 (standard alphabet, padded). Enough for Basic auth.
+fn base64_encode(input: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(A[(n >> 18 & 63) as usize] as char);
+        out.push(A[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            A[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Build the HTTP CONNECT request bytes for `host:port`, with optional Basic credentials.
+fn http_connect_request(host: &str, port: u16, auth: Option<&(String, String)>) -> Vec<u8> {
+    let mut s = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if let Some((u, p)) = auth {
+        let token = base64_encode(format!("{u}:{p}").as_bytes());
+        s.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    s.push_str("\r\n");
+    s.into_bytes()
+}
+
+/// Map an HTTP CONNECT status code to a Wisp close reason. `None` means success (2xx).
+fn map_http_status(code: u16) -> Option<u8> {
+    match code {
+        200..=299 => None,
+        407 | 403 => Some(R_BLOCKED),
+        _ => Some(R_UNREACHABLE),
+    }
+}
+
+async fn connect_http(
+    proxy: SocketAddr,
+    auth: Option<&(String, String)>,
+    host: &str,
+    port: u16,
+    cfg: &Config,
+) -> Result<TcpStream, u8> {
+    match tokio::time::timeout(cfg.connect_timeout, http_handshake(proxy, auth, host, port)).await {
+        Ok(res) => res,
+        Err(_) => Err(R_TIMEOUT),
+    }
+}
+
+async fn http_handshake(
+    proxy: SocketAddr,
+    auth: Option<&(String, String)>,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, u8> {
+    let mut sock = TcpStream::connect(proxy).await.map_err(|e| match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => R_REFUSED,
+        _ => R_UNREACHABLE,
+    })?;
+    sock.write_all(&http_connect_request(host, port, auth))
+        .await
+        .map_err(|_| R_UNREACHABLE)?;
+
+    // Read the response head one byte at a time until CRLFCRLF, bounded so a hostile proxy
+    // cannot make us read forever.
+    let mut buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = sock.read(&mut byte).await.map_err(|_| R_UNREACHABLE)?;
+        if n == 0 {
+            return Err(R_UNREACHABLE);
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            return Err(R_UNREACHABLE); // header block too large
+        }
+    }
+    // Status line: "HTTP/1.1 200 Connection established".
+    let head = std::str::from_utf8(&buf).map_err(|_| R_UNREACHABLE)?;
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or(R_UNREACHABLE)?;
+    if let Some(reason) = map_http_status(code) {
+        return Err(reason);
+    }
+    let _ = sock.set_nodelay(true);
+    Ok(sock)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn addr(r: &Route) -> String {
         match r {
-            Route::Socks5 { addr, .. } => addr.to_string(),
+            Route::Socks5 { addr, .. } | Route::Http { addr, .. } => addr.to_string(),
             Route::Direct => "direct".into(),
         }
     }
 
     #[test]
-    fn parses_single_socks5() {
-        let m = parse_routes("warp=socks5://127.0.0.1:40000").unwrap();
-        assert_eq!(m.len(), 2); // direct + warp
-        assert_eq!(addr(&m["warp"]), "127.0.0.1:40000");
-        assert!(matches!(&m["warp"], Route::Socks5 { auth: None, .. }));
+    fn yaml_parses_socks5_and_http() {
+        let y = r#"
+routes:
+  - name: tor
+    type: socks5
+    address: "127.0.0.1:9050"
+  - name: corp
+    type: http
+    address: "127.0.0.1:8080"
+    username: u
+    password: p
+"#;
+        let m = routes_from_yaml(y).unwrap();
+        assert_eq!(addr(&m["tor"]), "127.0.0.1:9050");
+        assert!(matches!(&*m["tor"], Route::Socks5 { auth: None, .. }));
+        assert!(matches!(&*m["corp"], Route::Http { auth: Some(_), .. }));
+        assert!(m.contains_key(DIRECT));
     }
 
     #[test]
-    fn parses_multiple_and_credentials() {
-        let m = parse_routes("warp=socks5://127.0.0.1:40000,tor=socks5://u:p@127.0.0.1:9050")
-            .unwrap();
-        assert_eq!(m.len(), 3); // direct + warp + tor
-        match &m["tor"] {
-            Route::Socks5 {
-                auth: Some((u, p)), ..
-            } => {
-                assert_eq!(u, "u");
-                assert_eq!(p, "p");
-            }
-            _ => panic!("expected socks5 with auth"),
-        }
+    fn yaml_rejects_reserved_direct() {
+        let y = "routes:\n  - name: direct\n    type: socks5\n    address: \"127.0.0.1:1\"\n";
+        assert!(routes_from_yaml(y).is_err());
     }
 
     #[test]
-    fn rejects_unknown_scheme() {
-        assert!(parse_routes("x=http://127.0.0.1:8080").is_err());
+    fn yaml_rejects_unknown_type() {
+        let y = "routes:\n  - name: x\n    type: ftp\n    address: \"127.0.0.1:1\"\n";
+        assert!(routes_from_yaml(y).is_err());
     }
 
     #[test]
-    fn rejects_duplicate_name() {
-        assert!(parse_routes("a=socks5://127.0.0.1:1,a=socks5://127.0.0.1:2").is_err());
+    fn yaml_rejects_duplicate_name() {
+        let y = "routes:\n  - name: a\n    type: socks5\n    address: \"127.0.0.1:1\"\n  - name: a\n    type: socks5\n    address: \"127.0.0.1:2\"\n";
+        assert!(routes_from_yaml(y).is_err());
     }
 
     #[test]
-    fn rejects_reserved_direct_name() {
-        assert!(parse_routes("direct=socks5://127.0.0.1:1").is_err());
+    fn yaml_rejects_bad_address() {
+        let y = "routes:\n  - name: a\n    type: socks5\n    address: \"not-an-addr\"\n";
+        assert!(routes_from_yaml(y).is_err());
     }
 
     #[test]
-    fn rejects_bad_port() {
-        assert!(parse_routes("a=socks5://127.0.0.1:99999").is_err());
-        assert!(parse_routes("a=socks5://127.0.0.1").is_err());
+    fn yaml_empty_is_direct_only() {
+        assert_eq!(routes_from_yaml("routes: []").unwrap().len(), 1);
+        assert!(routes_from_yaml("routes: []").unwrap().contains_key(DIRECT));
     }
 
     #[test]
-    fn empty_spec_is_direct_only() {
-        assert_eq!(parse_routes("").unwrap().len(), 1);
-        assert_eq!(parse_routes("   ").unwrap().len(), 1);
-        assert!(parse_routes("").unwrap().contains_key(DIRECT));
+    fn http_request_has_connect_line_and_host() {
+        let req = http_connect_request("example.com", 443, None);
+        let s = String::from_utf8(req).unwrap();
+        assert!(s.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        assert!(s.contains("Host: example.com:443\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+        assert!(!s.contains("Proxy-Authorization"));
+    }
+
+    #[test]
+    fn http_request_includes_basic_auth() {
+        let auth = ("u".to_string(), "p".to_string());
+        let req = http_connect_request("h", 80, Some(&auth));
+        let s = String::from_utf8(req).unwrap();
+        // base64("u:p") = "dTpw"
+        assert!(s.contains("Proxy-Authorization: Basic dTpw\r\n"));
+    }
+
+    #[test]
+    fn http_status_maps() {
+        assert_eq!(map_http_status(200), None);
+        assert_eq!(map_http_status(407), Some(R_BLOCKED));
+        assert_eq!(map_http_status(403), Some(R_BLOCKED));
+        assert_eq!(map_http_status(502), Some(R_UNREACHABLE));
+        assert_eq!(map_http_status(504), Some(R_UNREACHABLE));
+        assert_eq!(map_http_status(500), Some(R_UNREACHABLE));
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b"u:p"), "dTpw");
+        assert_eq!(base64_encode(b"Aladdin:open sesame"), "QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        assert_eq!(base64_encode(b""), "");
     }
 
     #[test]

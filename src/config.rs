@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::route::{direct_routes, parse_routes, Route};
+use crate::route::{direct_routes, Route};
 
 /// Wisp per-stream flow-control window, in packets. The client may have at most this many
 /// unacked DATA packets in flight before it must wait for a CONTINUE. The per-stream intake
@@ -33,7 +34,7 @@ pub struct Config {
     /// Hostnames containing any of these substrings are refused.
     pub host_blacklist: Vec<String>,
     /// Named outbound routes selectable via `?route=`. Always contains `direct`.
-    pub routes: HashMap<String, Route>,
+    pub routes: HashMap<String, Arc<Route>>,
 }
 
 impl Default for Config {
@@ -67,9 +68,9 @@ impl Config {
     /// - `MAX_STREAMS`: max concurrent streams per connection (default 256).
     /// - `BLOCK_PRIVATE`: `1`/`true` to refuse private-range targets (default off).
     /// - `HOST_BLACKLIST`: comma-separated hostname substrings to refuse.
-    /// - `ROUTES`: comma-separated `name=socks5://[user:pass@]host:port` upstream routes,
-    ///   selectable via `?route=<name>`. `direct` is implicit and reserved. A malformed
-    ///   spec is fatal (returns `Err`).
+    /// - `CONFIG`: path to a YAML route config (default `config.yaml` if present). See
+    ///   `config.example.yaml`. Routes are selectable via `?route=<name>`; `direct` is
+    ///   implicit and reserved. A malformed config is fatal (returns `Err`).
     pub fn from_env() -> Result<Self, String> {
         let mut cfg = Config::default();
 
@@ -123,8 +124,21 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
-        if let Ok(spec) = std::env::var("ROUTES") {
-            cfg.routes = parse_routes(&spec).map_err(|e| format!("invalid ROUTES: {e}"))?;
+        // Routes come from a YAML config file (the env var ROUTES was removed).
+        let path = std::env::var("CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
+        match std::fs::read_to_string(&path) {
+            Ok(body) => {
+                cfg.routes =
+                    crate::route::routes_from_yaml(&body).map_err(|e| format!("{path}: {e}"))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No config file: direct only. Only an explicitly-set CONFIG that is missing
+                // is an error; the default path being absent is fine.
+                if std::env::var("CONFIG").is_ok() {
+                    return Err(format!("{path}: {e}"));
+                }
+            }
+            Err(e) => return Err(format!("{path}: {e}")),
         }
 
         Ok(cfg)

@@ -1,0 +1,26 @@
+# Routes selectable from the UI. `direct` (no proxy) always exists implicitly.
+# Point the server at this file with CONFIG=config.yaml (the default path).
+routes:
+  # Cloudflare WARP, registered in-process (one binary, no warp-cli):
+  - name: warp
+    type: warp
+
+  # A generic WireGuard peer you configure yourself (e.g. wgcf-generated):
+  # - name: myvpn
+  #   type: wireguard
+  #   private_key: "<base64 private key>"
+  #   peer_public_key: "<base64 peer public key>"
+  #   endpoint: "engage.cloudflareclient.com:2408"
+  #   address: "172.16.0.2/32"
+
+  # A SOCKS5 upstream (Tor, etc.):
+  - name: tor
+    type: socks5
+    address: "127.0.0.1:9050"
+
+  # An HTTP CONNECT proxy (optional credentials):
+  - name: corp
+    type: http
+    address: "127.0.0.1:8080"
+    # username: "u"
+    # password: "p"

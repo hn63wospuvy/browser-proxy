@@ -81,7 +81,7 @@ async fn ws_handler(
     // doesn't consume a slot. Unknown route → 400, never a silent direct fallback.
     let route_name = params.get("route").map(String::as_str).unwrap_or(DIRECT);
     let route = match state.cfg.routes.get(route_name) {
-        Some(r) => Arc::new(r.clone()),
+        Some(r) => r.clone(), // clones the Arc<Route>, not the Route
         None => {
             return (StatusCode::BAD_REQUEST, format!("unknown route: {route_name}"))
                 .into_response();

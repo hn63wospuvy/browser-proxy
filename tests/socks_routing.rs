@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use browser_proxy::config::Config;
-use browser_proxy::route::parse_routes;
+use browser_proxy::route::routes_from_yaml;
 use browser_proxy::server::build_router;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -132,9 +132,14 @@ async fn spawn_fake_socks(reply_override: Option<u8>) -> u16 {
     port
 }
 
-async fn spawn_proxy_with_routes(spec: &str) -> u16 {
+/// YAML for a single `test` SOCKS5 route pointing at `port`.
+fn socks_yaml(port: u16) -> String {
+    format!("routes:\n  - name: test\n    type: socks5\n    address: \"127.0.0.1:{port}\"\n")
+}
+
+async fn spawn_proxy_with_routes(yaml: &str) -> u16 {
     let cfg = Config {
-        routes: parse_routes(spec).unwrap(),
+        routes: routes_from_yaml(yaml).unwrap(),
         ..Default::default()
     };
     let app = build_router(Arc::new(cfg), "static");
@@ -151,8 +156,7 @@ async fn routes_through_socks_to_echo() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let echo = spawn_echo().await;
         let socks = spawn_fake_socks(None).await;
-        let spec = format!("test=socks5://127.0.0.1:{socks}");
-        let proxy = spawn_proxy_with_routes(&spec).await;
+        let proxy = spawn_proxy_with_routes(&socks_yaml(socks)).await;
 
         let url = format!("ws://127.0.0.1:{proxy}/wisp/?route=test");
         let (mut ws, _) = connect_async(url.as_str()).await.expect("ws connect");
@@ -187,7 +191,7 @@ async fn routes_through_socks_to_echo() {
 #[tokio::test]
 async fn unknown_route_is_rejected() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let proxy = spawn_proxy_with_routes("test=socks5://127.0.0.1:1").await;
+        let proxy = spawn_proxy_with_routes(&socks_yaml(1)).await;
         let url = format!("ws://127.0.0.1:{proxy}/wisp/?route=nope");
         // tungstenite surfaces a non-101 upgrade as an Http error; just assert it fails.
         assert!(
@@ -203,8 +207,7 @@ async fn unknown_route_is_rejected() {
 async fn socks_refused_closes_stream() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let socks = spawn_fake_socks(Some(0x05)).await; // connection refused
-        let spec = format!("test=socks5://127.0.0.1:{socks}");
-        let proxy = spawn_proxy_with_routes(&spec).await;
+        let proxy = spawn_proxy_with_routes(&socks_yaml(socks)).await;
 
         let url = format!("ws://127.0.0.1:{proxy}/wisp/?route=test");
         let (mut ws, _) = connect_async(url.as_str()).await.expect("ws connect");
@@ -245,9 +248,8 @@ async fn spawn_silent_socks() -> u16 {
 async fn silent_proxy_times_out() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let socks = spawn_silent_socks().await;
-        let spec = format!("test=socks5://127.0.0.1:{socks}");
         let cfg = Config {
-            routes: parse_routes(&spec).unwrap(),
+            routes: routes_from_yaml(&socks_yaml(socks)).unwrap(),
             connect_timeout: Duration::from_secs(1), // short, so the test is fast
             ..Default::default()
         };
