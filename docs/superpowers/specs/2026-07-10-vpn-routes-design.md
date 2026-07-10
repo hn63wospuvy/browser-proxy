@@ -195,7 +195,7 @@ comes from operator configuration, not from an attacker-controlled CONNECT.
 `/routes.json`, hidden entirely when only `direct` exists. The selection persists in
 `localStorage`. `wispUrl()` (`static/index.js`) appends `?route=<name>`.
 
-Changing the route calls `connection.setTransport("/libcurl/index.mjs", [{ wisp: wispUrl() }])`,
+Changing the route calls `connection.setTransport("/libcurl/index.mjs", [{ websocket: wispUrl() }])`,
 which **rebuilds the transport inside the bare-mux SharedWorker**, killing the live
 WebSocket and every stream on it. The handler therefore re-navigates the frame to the current
 URL. This is required behavior, not incidental.
