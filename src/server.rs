@@ -16,7 +16,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
-use crate::wisp;
+use crate::{metrics, wisp};
 
 /// Cap on a single WebSocket message / frame. Wisp DATA frames from the real client are
 /// ~16 KiB; this stops a hostile client from sending a single multi-MiB frame.
@@ -44,6 +44,7 @@ pub fn build_router(cfg: Arc<Config>, static_dir: &str) -> Router {
     Router::new()
         .route("/wisp/", get(ws_handler))
         .route("/wisp", get(ws_handler))
+        .route("/debug/stats", get(stats_handler))
         .nest_service("/scram", sd("scram"))
         .nest_service("/baremux", sd("baremux"))
         .nest_service("/libcurl", sd("libcurl"))
@@ -73,6 +74,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
     let permit = match state.conn_sem.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            metrics::inc(&metrics::connections_rejected_maxconn);
             return (StatusCode::SERVICE_UNAVAILABLE, "too many connections").into_response();
         }
     };
@@ -85,6 +87,14 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
             let _permit = permit;
             wisp::handle_connection(socket, cfg).await;
         })
+}
+
+async fn stats_handler() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        metrics::snapshot_json(),
+    )
+        .into_response()
 }
 
 /// Log a clear hint if the vendored client assets have not been fetched yet.

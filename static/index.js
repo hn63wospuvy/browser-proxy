@@ -5,6 +5,7 @@ const address = document.getElementById("proxy-address");
 const statusEl = document.getElementById("proxy-status");
 const errorEl = document.getElementById("proxy-error");
 const errorCode = document.getElementById("proxy-error-code");
+const frameHost = document.getElementById("frame-host");
 
 const SEARCH_TEMPLATE = "https://www.google.com/search?q=%s";
 
@@ -19,9 +20,14 @@ const scramjet = new ScramjetController({
 });
 scramjet.init();
 
-// bare-mux connection; the chosen transport is stored in a SharedWorker and reused by the
-// service worker after we navigate top-level.
+// bare-mux connection; the libcurl transport (and its Wisp WebSocket) runs in the bare-mux
+// SharedWorker owned by THIS page. We keep this page alive and render the proxied site in an
+// iframe — a top-level navigation would tear this page down and kill the transport, so only
+// the first request would succeed and every subresource would fail.
 const connection = new BareMux.BareMuxConnection("/baremux/worker.js");
+
+// Reused across navigations so the transport/frame stay alive.
+let frame = null;
 
 function wispUrl() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
@@ -44,15 +50,19 @@ form.addEventListener("submit", async (event) => {
   if (!target) return;
 
   try {
-    statusEl.textContent = "Starting proxy…";
+    statusEl.textContent = "Starting…";
     await registerSW();
     await navigator.serviceWorker.ready;
     await ensureTransport();
 
-    // Top-level navigation: the whole tab becomes the proxied site.
-    const encoded = await scramjet.encodeUrl(target);
-    statusEl.textContent = "Loading…";
-    window.location.href = encoded;
+    if (!frame) {
+      frame = scramjet.createFrame();
+      frame.frame.id = "sj-frame";
+      frameHost.appendChild(frame.frame);
+    }
+    document.body.classList.add("browsing"); // reveal the frame, hide the landing
+    statusEl.textContent = "";
+    frame.go(target);
   } catch (err) {
     statusEl.textContent = "";
     errorEl.textContent = "Failed to start the proxy.";

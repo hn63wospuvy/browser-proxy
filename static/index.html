@@ -16,30 +16,31 @@
     <script src="/index.js" defer></script>
   </head>
   <body>
-    <main>
-      <h1>Browser Proxy</h1>
-      <p class="tagline">Type any URL and browse it through this server.</p>
-
+    <!-- Slim top bar: URL input, always available for navigating to a new site. -->
+    <header id="bar">
       <form id="proxy-form" autocomplete="off">
         <input
           id="proxy-address"
           type="text"
           inputmode="url"
-          placeholder="example.com  or  a search query"
+          placeholder="Type a URL (example.com) or a search query"
           aria-label="URL to proxy"
           autofocus
         />
         <button type="submit">Go</button>
       </form>
+      <span id="proxy-status" class="status"></span>
+    </header>
 
-      <p id="proxy-status" class="status"></p>
+    <!-- Landing shown before the first navigation. -->
+    <section id="landing">
+      <h1>Browser Proxy</h1>
+      <p>Type any URL above and browse it through this server.</p>
       <p id="proxy-error" class="error"></p>
       <pre id="proxy-error-code" class="error-code"></pre>
+    </section>
 
-      <footer>
-        Powered by <a href="https://github.com/MercuryWorkshop/scramjet">Scramjet</a>
-        over a Rust Wisp backend.
-      </footer>
-    </main>
+    <!-- The proxied site renders in this full-viewport frame. -->
+    <main id="frame-host"></main>
   </body>
 </html>

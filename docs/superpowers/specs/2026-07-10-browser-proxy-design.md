@@ -26,8 +26,15 @@ JavaScript-heavy sites (SPAs, YouTube, video) and feel smooth (no lag).
   async multiplexed TCP relay. This is where Rust's performance matters.
 - **Scale**: personal / small internal use. Shared process, no per-user isolation, no
   auth. SSRF guard for private IP ranges is available but off by default (configurable).
-- **Frontend**: minimal — one URL input + Go button. On Go we navigate the whole tab
-  **top-level** to the proxied URL (most compatible; avoids iframe-busting).
+- **Frontend**: minimal — one URL input + Go button. On Go we render the proxied site in a
+  **full-viewport iframe** (`scramjet.createFrame()`).
+
+  > **Correction (post-implementation).** The original plan was top-level navigation. In
+  > practice that breaks: top-level navigation destroys the frontend page that hosts the
+  > libcurl transport (in the bare-mux SharedWorker), so only the first request succeeds and
+  > every subresource fails client-side. The iframe keeps the page — and the transport —
+  > alive, so all resource streams work. Scramjet neutralizes frame-busting, so a
+  > full-viewport iframe still behaves like the tab is the site.
 
 ## Architecture
 
@@ -113,7 +120,8 @@ Server behavior:
 - `index.js` — construct `ScramjetController({files:{wasm,all,sync}})`, `init()`, create
   `BareMux.BareMuxConnection('/baremux/worker.js')`; on submit: register SW, wait for
   `serviceWorker.ready`, `setTransport('/libcurl/index.mjs', [{ websocket: wispUrl }])`,
-  then `location.href = scramjet.encodeUrl(url)` (top-level navigation).
+  then `scramjet.createFrame()` and `frame.go(url)` into a full-viewport iframe (see the
+  frontend correction above — top-level navigation kills the transport).
 
 ## Asset vendoring (`scripts/fetch-assets.mjs`)
 

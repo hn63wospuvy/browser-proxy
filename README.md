@@ -66,9 +66,13 @@ Then open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press
    [bare-mux](https://github.com/MercuryWorkshop/bare-mux) at the **libcurl** transport,
    which speaks the [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) protocol to
    `wss://<host>/wisp/`.
-2. Pressing Go navigates the whole tab (top-level) to `scramjet.encodeUrl(url)`.
-3. The service worker intercepts that navigation and every resource the page requests,
-   rewrites URLs, and performs the real requests via the libcurl WASM client.
+2. Pressing Go renders the proxied site in a **full-viewport iframe** via
+   `scramjet.createFrame()`. The frontend page must stay alive because it hosts the libcurl
+   transport (in the bare-mux SharedWorker); a top-level navigation would tear it down and
+   only the first request would succeed. Scramjet neutralizes frame-busting, so the frame
+   still behaves like the tab is the site.
+3. The service worker intercepts every request the framed page makes, rewrites URLs, and
+   performs the real requests via the libcurl WASM client.
 4. libcurl opens Wisp streams over a single WebSocket to `/wisp/`.
 5. The Rust **Wisp server** ([`src/wisp.rs`](src/wisp.rs)) opens one raw TCP socket per
    stream to the target host:port and relays bytes both ways, using the Wisp CONTINUE
@@ -100,10 +104,15 @@ cargo test -- --ignored         # also runs the real-internet relay test (needs 
   expose it publicly (`BIND=0.0.0.0`) without adding auth and setting `BLOCK_PRIVATE=1`.
 - **TCP only.** UDP/QUIC Wisp streams are refused; browsers fall back to TCP HTTP, which is
   what the libcurl transport uses anyway.
-- **Very heavy / DRM sites** (e.g. YouTube with Widevine) may not fully work — that is a
-  limitation of the client-side proxy layer (Scramjet), not the Rust backend. Ordinary
-  sites, SPAs, images, and progressive video stream fine.
-- Scramjet is pinned to v1.1.0 (matching the upstream demo); v2 is still alpha.
+- **Rewriting gaps are Scramjet's, not the backend's.** On some sites a few resources (e.g.
+  certain `img` URLs Scramjet fails to rewrite) load blank while the rest of the page works.
+  That is the client-side rewriter (Scramjet v1), independent of the Rust Wisp relay.
+- **Very heavy / DRM sites** (e.g. YouTube with Widevine) may not fully work — again a
+  Scramjet-layer limitation, not the Rust backend. Ordinary sites, SPAs, images, and
+  progressive video stream fine.
+- Scramjet is pinned to v1.1.0 (matching the upstream demo); v2 is still alpha and rewrites
+  more sites correctly.
+- **Debug:** `GET /debug/stats` returns Wisp counters (connections/streams/failures) as JSON.
 
 ## Credits
 

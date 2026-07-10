@@ -31,6 +31,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::config::{is_private_ip, Config};
+use crate::metrics;
 
 // Packet types.
 const T_CONNECT: u8 = 0x01;
@@ -140,6 +141,7 @@ struct StreamHandle {
 
 /// Entry point: drive one Wisp connection to completion.
 pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
+    metrics::inc(&metrics::connections_total);
     let (mut sink, mut ws_stream) = socket.split();
 
     // Writer task: the single owner of the WS sink.
@@ -196,6 +198,7 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
                         }
                         // Cap concurrent streams per connection.
                         if streams.len() >= cfg.max_streams {
+                            metrics::inc(&metrics::streams_refused_maxstreams);
                             let _ = ws_tx.send(close_packet(stream_id, R_REFUSED)).await;
                             continue;
                         }
@@ -216,6 +219,8 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
                             }
                         };
 
+                        tracing::debug!(stream_id, host = %host, port, active = streams.len(), "CONNECT");
+                        metrics::inc(&metrics::streams_total);
                         let (data_tx, data_rx) = mpsc::channel::<Bytes>(cfg.buffer_size as usize);
                         let outstanding = Arc::new(AtomicU32::new(0));
                         let jh = tokio::spawn(run_stream(
@@ -256,6 +261,8 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>) {
                         };
                         match outcome {
                             Outcome::WindowViolation => {
+                                metrics::inc(&metrics::streams_window_violation);
+                                tracing::warn!(stream_id, "window violation -> closing stream");
                                 let _ = ws_tx.send(close_packet(stream_id, R_INVALID)).await;
                                 if let Some(h) = streams.remove(&stream_id) {
                                     h.abort.abort();
@@ -343,8 +350,14 @@ async fn run_stream(
     outstanding: Arc<AtomicU32>,
 ) {
     let tcp = match connect_target(&host, port, &cfg).await {
-        Ok(s) => s,
+        Ok(s) => {
+            metrics::inc(&metrics::streams_connected);
+            tracing::debug!(stream_id, host = %host, port, "connected");
+            s
+        }
         Err(reason) => {
+            metrics::inc(&metrics::streams_connect_failed);
+            tracing::debug!(stream_id, host = %host, port, reason, "connect failed");
             let _ = ws_tx.send(close_packet(stream_id, reason)).await;
             let _ = done_tx.send(stream_id);
             return;
@@ -421,6 +434,8 @@ async fn run_stream(
         r = tcp_to_client => r,
     };
 
+    metrics::inc(&metrics::streams_closed);
+    tracing::debug!(stream_id, reason, "stream closed");
     let _ = ws_tx.send(close_packet(stream_id, reason)).await;
     let _ = done_tx.send(stream_id);
 }
