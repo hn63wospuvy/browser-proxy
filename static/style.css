@@ -20,23 +20,35 @@ body {
 }
 
 body {
-  display: flex;
-  flex-direction: column;
+  position: relative;
   height: 100vh;
+  overflow: hidden;
   background: var(--bg);
   color: var(--fg);
   font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
 }
 
-/* Slim top bar */
+/* Slim top bar — overlays the top of the frame so it can fade without shifting layout. */
 #bar {
-  flex: 0 0 auto;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
   display: flex;
   align-items: center;
   gap: 0.75rem;
   padding: 0.5rem 0.75rem;
-  background: #12151c;
+  background: #12151cf2;
   border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+  transition: opacity 0.9s ease;
+}
+
+/* Immersive mode: the bar fades out (toggle with Esc). */
+body.bar-hidden #bar {
+  opacity: 0;
+  pointer-events: none;
 }
 
 #proxy-form {
@@ -82,9 +94,10 @@ button:hover {
   white-space: nowrap;
 }
 
-/* Landing (before first navigation) */
+/* Landing (before first navigation) fills the screen. */
 #landing {
-  flex: 1;
+  position: absolute;
+  inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -117,11 +130,11 @@ button:hover {
   overflow-x: auto;
 }
 
-/* The proxied-site frame fills the viewport below the bar. */
+/* The proxied-site frame fills the whole viewport (bar overlays its top edge). */
 #frame-host {
-  flex: 1;
+  position: absolute;
+  inset: 0;
   display: none;
-  min-height: 0;
 }
 
 #sj-frame {
@@ -132,7 +145,6 @@ button:hover {
   background: #fff;
 }
 
-/* After the first navigation: show the frame, hide the landing. */
 body.browsing #landing {
   display: none;
 }
@@ -141,7 +153,35 @@ body.browsing #frame-host {
   display: block;
 }
 
-/* Immersive mode: hide the top bar (toggle with Ctrl+Esc). The frame then fills the tab. */
-body.bar-hidden #bar {
-  display: none;
+/* Transient hint pill (bottom-center), fades in when the bar hides. */
+#hint {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  padding: 0.5rem 0.9rem;
+  background: #12151ceb;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.85rem;
+  box-shadow: 0 6px 24px #0008;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.6s ease;
+}
+
+#hint.show {
+  opacity: 1;
+}
+
+#hint kbd {
+  font: inherit;
+  font-weight: 700;
+  padding: 0.05rem 0.4rem;
+  margin: 0 0.1rem;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 5px;
 }

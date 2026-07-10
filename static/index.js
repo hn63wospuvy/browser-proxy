@@ -29,37 +29,49 @@ const connection = new BareMux.BareMuxConnection("/baremux/worker.js");
 // Reused across navigations so the transport/frame stay alive.
 let frame = null;
 
-// --- Top-bar visibility: hidden while browsing, toggled with Ctrl+Esc ---
+// --- Top-bar visibility: fades out while browsing, toggled with Esc ---
 
-function toggleBar() {
-  const hidden = document.body.classList.toggle("bar-hidden");
-  if (!hidden) {
+let hintTimer = null;
+function showHint() {
+  const hint = document.getElementById("hint");
+  if (!hint) return;
+  hint.classList.add("show");
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => hint.classList.remove("show"), 3500);
+}
+
+function setBarHidden(hidden) {
+  document.body.classList.toggle("bar-hidden", hidden);
+  if (hidden) {
+    showHint();
+  } else {
     // Bar shown again: focus the URL box so a new destination can be typed.
     address.focus();
     address.select();
   }
 }
+function toggleBar() {
+  setBarHidden(!document.body.classList.contains("bar-hidden"));
+}
 // Expose so the injected in-iframe listener can reach it via window.parent.
 window.__toggleBar = toggleBar;
 
 function isToggleKey(e) {
-  // Ctrl+Esc. (On Windows this may be intercepted by the OS Start menu.)
-  return e.ctrlKey && (e.key === "Escape" || e.code === "Escape");
+  return e.key === "Escape" || e.code === "Escape";
 }
 
 function onHotkey(e) {
-  if (isToggleKey(e)) {
+  if (isToggleKey(e) && document.body.classList.contains("browsing")) {
     e.preventDefault();
-    // Only meaningful once we're actually browsing a site.
-    if (document.body.classList.contains("browsing")) toggleBar();
+    toggleBar();
   }
 }
 
 // Listen on the parent page (works when focus is outside the frame)...
 window.addEventListener("keydown", onHotkey, true);
 
-// ...and inside the frame on every load (the frame is same-origin, so the shortcut also
-// works while the user is interacting with the proxied page).
+// ...and inside the frame on every load (the frame is same-origin, so Esc also works while
+// the user is interacting with the proxied page).
 function injectFrameHotkey() {
   try {
     const doc = frame.frame.contentDocument;
@@ -67,7 +79,7 @@ function injectFrameHotkey() {
       doc.addEventListener(
         "keydown",
         (e) => {
-          if (e.ctrlKey && (e.key === "Escape" || e.code === "Escape")) {
+          if (e.key === "Escape" || e.code === "Escape") {
             e.preventDefault();
             window.__toggleBar();
           }
@@ -112,11 +124,11 @@ form.addEventListener("submit", async (event) => {
       frame.frame.addEventListener("load", injectFrameHotkey);
       frameHost.appendChild(frame.frame);
     }
-    // Reveal the frame, hide the landing, and hide the top bar for an immersive view.
+    // Reveal the frame, hide the landing, then fade the bar out (with a hint).
     document.body.classList.add("browsing");
-    document.body.classList.add("bar-hidden");
     statusEl.textContent = "";
     frame.go(target);
+    setBarHidden(true);
   } catch (err) {
     statusEl.textContent = "";
     errorEl.textContent = "Failed to start the proxy.";
