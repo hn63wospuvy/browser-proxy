@@ -58,7 +58,50 @@ Then open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press
 | `MAX_STREAMS` | `256` | Max concurrent streams per connection (further CONNECTs get refused). |
 | `BLOCK_PRIVATE` | `0` | `1`/`true` refuses targets on private/loopback/link-local IPs (SSRF guard). |
 | `HOST_BLACKLIST` | *(empty)* | Comma-separated hostname substrings to refuse. |
+| `ROUTES` | *(empty)* | Comma-separated `name=socks5://[user:pass@]host:port` upstream routes, selectable in the UI via `?route=`. `direct` is always available. A malformed value aborts startup. See [Routing through a VPN](#routing-through-a-vpn). |
 | `RUST_LOG` | `browser_proxy=info` | Log filter (`tower_http=debug` to log every request). |
+
+## Routing through a VPN
+
+Outbound connections can be sent through any VPN or proxy that exposes a **SOCKS5**
+endpoint, chosen per-navigation from a dropdown in the UI. Target sites then see the VPN's
+IP, not the server's.
+
+Define named routes in `ROUTES` and pick one in the UI. `direct` (no proxy) is always
+present; the dropdown is hidden when no other route is configured.
+
+**Cloudflare WARP** (`1.1.1.1`): run WARP in proxy mode, which exposes a local SOCKS5
+listener *without* capturing the host routing table (so `direct` still goes out directly):
+
+```bash
+warp-cli mode proxy          # SOCKS5 on 127.0.0.1:40000 by default
+warp-cli connect
+ROUTES="warp=socks5://127.0.0.1:40000" cargo run --release
+```
+
+**Tor**: `ROUTES="tor=socks5://127.0.0.1:9050"` (with the Tor daemon running).
+
+Several at once:
+
+```bash
+ROUTES="warp=socks5://127.0.0.1:40000,tor=socks5://127.0.0.1:9050" cargo run --release
+```
+
+**Fail closed.** If the selected route doesn't exist the WebSocket upgrade is rejected
+(HTTP 400); if the proxy is down the stream closes. Traffic is *never* silently sent
+directly when a VPN route was requested.
+
+**DNS.** On a SOCKS5 route the target hostname is handed to the proxy to resolve, so no DNS
+query for the destination leaves this machine.
+
+**Two caveats within the "personal use" scope:**
+
+- `BLOCK_PRIVATE` cannot filter a *hostname* on a SOCKS5 route (the name is resolved by the
+  proxy, not here). IP-literal targets are still checked. The SSRF exposure is smaller on a
+  VPN route anyway, since connections originate from the VPN's network, not this host.
+- The client transport is a **SharedWorker shared across all tabs** of the origin. Selecting
+  a route affects every open tab, not just the current one. Use one tab at a time if you
+  rely on per-tab routes.
 
 ## How it works
 

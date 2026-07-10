@@ -133,8 +133,10 @@ async fn spawn_fake_socks(reply_override: Option<u8>) -> u16 {
 }
 
 async fn spawn_proxy_with_routes(spec: &str) -> u16 {
-    let mut cfg = Config::default();
-    cfg.routes = parse_routes(spec).unwrap();
+    let cfg = Config {
+        routes: parse_routes(spec).unwrap(),
+        ..Default::default()
+    };
     let app = build_router(Arc::new(cfg), "static");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -244,9 +246,11 @@ async fn silent_proxy_times_out() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let socks = spawn_silent_socks().await;
         let spec = format!("test=socks5://127.0.0.1:{socks}");
-        let mut cfg = Config::default();
-        cfg.routes = parse_routes(&spec).unwrap();
-        cfg.connect_timeout = Duration::from_secs(1); // short, so the test is fast
+        let cfg = Config {
+            routes: parse_routes(&spec).unwrap(),
+            connect_timeout: Duration::from_secs(1), // short, so the test is fast
+            ..Default::default()
+        };
         let app = build_router(Arc::new(cfg), "static");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = listener.local_addr().unwrap().port();
