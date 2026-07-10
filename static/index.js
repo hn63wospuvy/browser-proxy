@@ -6,11 +6,26 @@ const statusEl = document.getElementById("proxy-status");
 const errorEl = document.getElementById("proxy-error");
 const errorCode = document.getElementById("proxy-error-code");
 const frameHost = document.getElementById("frame-host");
+// Two selects share one route: a prominent one in the center landing, and a small one in the
+// top bar for switching mid-browse (the landing is hidden while browsing).
 const routeSelect = document.getElementById("proxy-route");
+const routeSelectLanding = document.getElementById("proxy-route-landing");
+const routePicker = document.getElementById("route-picker");
 const ROUTE_KEY = "proxy-route";
 
-// Populate the route dropdown from the server. Hidden entirely when only `direct` exists,
-// so users without any VPN configured see no extra control.
+function fillSelect(sel, routes, value) {
+  sel.replaceChildren();
+  for (const name of routes) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  }
+  sel.value = value;
+}
+
+// Populate both dropdowns from the server. Hidden entirely when only `direct` exists, so
+// users without any VPN configured see no extra control.
 async function loadRoutes() {
   let routes = ["direct"];
   try {
@@ -22,40 +37,40 @@ async function loadRoutes() {
   } catch (_) {
     /* fall back to direct-only */
   }
-  if (routes.length <= 1) return; // only `direct`: leave the select hidden
+  if (routes.length <= 1) return; // only `direct`: leave both selects hidden
 
-  routeSelect.replaceChildren();
-  for (const name of routes) {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = name;
-    routeSelect.appendChild(opt);
-  }
   const saved = localStorage.getItem(ROUTE_KEY);
-  if (saved && routes.includes(saved)) routeSelect.value = saved;
+  const value = saved && routes.includes(saved) ? saved : routes[0];
+  fillSelect(routeSelect, routes, value);
+  fillSelect(routeSelectLanding, routes, value);
   routeSelect.hidden = false;
+  routePicker.hidden = false;
 }
 
 function currentRoute() {
-  return routeSelect && !routeSelect.hidden ? routeSelect.value : "direct";
+  return !routeSelect.hidden ? routeSelect.value : "direct";
 }
 
-loadRoutes();
-
-// Changing the route rebuilds the transport, which tears down the live WebSocket and every
-// stream on it. Re-navigate the frame to the last target so the page reloads over the new
-// route instead of dying half-loaded.
-routeSelect.addEventListener("change", async () => {
-  localStorage.setItem(ROUTE_KEY, routeSelect.value);
+// Apply a route change from either select: mirror to the other, persist, and — while browsing
+// — rebuild the transport (which tears down the live WebSocket) and reload the frame so the
+// page reloads over the new route instead of dying half-loaded.
+async function onRouteChange(value) {
+  routeSelect.value = value;
+  routeSelectLanding.value = value;
+  localStorage.setItem(ROUTE_KEY, value);
   if (!frame || !document.body.classList.contains("browsing")) return;
   try {
     await ensureTransport();
-    const target = frame.__lastTarget;
-    if (target) frame.go(target);
+    if (frame.__lastTarget) frame.go(frame.__lastTarget);
   } catch (err) {
     console.error("route switch failed", err);
   }
-});
+}
+
+routeSelect.addEventListener("change", () => onRouteChange(routeSelect.value));
+routeSelectLanding.addEventListener("change", () => onRouteChange(routeSelectLanding.value));
+
+loadRoutes();
 
 // Search engine used when the input is NOT a valid URL / IP / domain (see search.js).
 // Google aggressively CAPTCHAs proxied traffic (all requests share one IP + the libcurl-WASM

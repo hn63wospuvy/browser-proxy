@@ -88,6 +88,30 @@ input:focus {
   border-color: var(--accent);
 }
 
+/* Prominent route picker on the landing page (before browsing). */
+#route-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1.25rem;
+  font-size: 1rem;
+  color: var(--muted, #9aa4b2);
+}
+
+#route-picker select {
+  padding: 0.5rem 0.75rem;
+  font-size: 1rem;
+  color: var(--fg);
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+#route-picker select:focus {
+  border-color: var(--accent);
+}
+
 button {
   padding: 0.55rem 1.1rem;
   font-size: 0.95rem;
