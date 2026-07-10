@@ -168,8 +168,10 @@ function injectFrameHotkey() {
 function wispUrl() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const route = currentRoute();
-  const q = route && route !== "direct" ? `?route=${encodeURIComponent(route)}` : "";
-  return `${scheme}://${location.host}/wisp/${q}`;
+  // The route is a path segment (not a query) so the URL keeps its trailing slash — the
+  // libcurl client rejects a WebSocket URL that doesn't end in "/".
+  const seg = route && route !== "direct" ? `${encodeURIComponent(route)}/` : "";
+  return `${scheme}://${location.host}/wisp/${seg}`;
 }
 
 /**

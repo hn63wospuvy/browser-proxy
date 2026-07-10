@@ -158,7 +158,7 @@ async fn routes_through_socks_to_echo() {
         let socks = spawn_fake_socks(None).await;
         let proxy = spawn_proxy_with_routes(&socks_yaml(socks)).await;
 
-        let url = format!("ws://127.0.0.1:{proxy}/wisp/?route=test");
+        let url = format!("ws://127.0.0.1:{proxy}/wisp/test/");
         let (mut ws, _) = connect_async(url.as_str()).await.expect("ws connect");
         let _ = expect_binary(ws.next().await.unwrap().unwrap()); // handshake CONTINUE
 
@@ -192,7 +192,7 @@ async fn routes_through_socks_to_echo() {
 async fn unknown_route_is_rejected() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let proxy = spawn_proxy_with_routes(&socks_yaml(1)).await;
-        let url = format!("ws://127.0.0.1:{proxy}/wisp/?route=nope");
+        let url = format!("ws://127.0.0.1:{proxy}/wisp/nope/");
         // tungstenite surfaces a non-101 upgrade as an Http error; just assert it fails.
         assert!(
             connect_async(url.as_str()).await.is_err(),
@@ -209,7 +209,7 @@ async fn socks_refused_closes_stream() {
         let socks = spawn_fake_socks(Some(0x05)).await; // connection refused
         let proxy = spawn_proxy_with_routes(&socks_yaml(socks)).await;
 
-        let url = format!("ws://127.0.0.1:{proxy}/wisp/?route=test");
+        let url = format!("ws://127.0.0.1:{proxy}/wisp/test/");
         let (mut ws, _) = connect_async(url.as_str()).await.expect("ws connect");
         let _ = expect_binary(ws.next().await.unwrap().unwrap());
 
@@ -260,7 +260,7 @@ async fn silent_proxy_times_out() {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let url = format!("ws://127.0.0.1:{proxy}/wisp/?route=test");
+        let url = format!("ws://127.0.0.1:{proxy}/wisp/test/");
         let (mut ws, _) = connect_async(url.as_str()).await.expect("ws connect");
         let _ = expect_binary(ws.next().await.unwrap().unwrap());
 

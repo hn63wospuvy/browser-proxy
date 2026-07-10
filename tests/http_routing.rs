@@ -123,7 +123,7 @@ async fn routes_through_http_connect_to_echo() {
             format!("routes:\n  - name: web\n    type: http\n    address: \"127.0.0.1:{http}\"\n");
         let proxy = spawn_proxy(&yaml).await;
 
-        let url = format!("ws://127.0.0.1:{proxy}/wisp/?route=web");
+        let url = format!("ws://127.0.0.1:{proxy}/wisp/web/");
         let (mut ws, _) = connect_async(url.as_str()).await.expect("ws");
         let _ = expect_binary(ws.next().await.unwrap().unwrap());
 

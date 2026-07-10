@@ -49,7 +49,7 @@ async fn warp_end_to_end() {
         axum::serve(l, app).await.unwrap();
     });
 
-    let url = format!("ws://127.0.0.1:{port}/wisp/?route=warp");
+    let url = format!("ws://127.0.0.1:{port}/wisp/warp/");
     let (mut ws, _) = connect_async(url.as_str()).await.unwrap();
     let _ = ws.next().await.unwrap().unwrap(); // handshake CONTINUE
 

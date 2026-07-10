@@ -1,11 +1,10 @@
 //! The axum HTTP router: static assets + the `/wisp/` WebSocket endpoint.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, State};
 use axum::http::header::{HeaderName, HeaderValue, CACHE_CONTROL};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -44,8 +43,12 @@ pub fn build_router(cfg: Arc<Config>, static_dir: &str) -> Router {
     };
 
     Router::new()
-        .route("/wisp/", get(ws_handler))
-        .route("/wisp", get(ws_handler))
+        // The route is a PATH segment, not a query param, so the WebSocket URL keeps its
+        // trailing slash — the libcurl client rejects a URL that doesn't end in `/`.
+        .route("/wisp/", get(ws_handler_direct))
+        .route("/wisp", get(ws_handler_direct))
+        .route("/wisp/:route/", get(ws_handler_named))
+        .route("/wisp/:route", get(ws_handler_named))
         .route("/debug/stats", get(stats_handler))
         .route("/routes.json", get(routes_handler))
         .nest_service("/scram", sd("scram"))
@@ -72,14 +75,23 @@ fn header_layer(name: &'static str, value: &'static str) -> SetResponseHeaderLay
     )
 }
 
-async fn ws_handler(
+/// `/wisp/` (and `/wisp`): the default `direct` route.
+async fn ws_handler_direct(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    upgrade_wisp(ws, state, DIRECT).await
+}
+
+/// `/wisp/<route>/`: a named route selected by path segment.
+async fn ws_handler_named(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
+    AxumPath(route): AxumPath<String>,
 ) -> Response {
+    upgrade_wisp(ws, state, &route).await
+}
+
+async fn upgrade_wisp(ws: WebSocketUpgrade, state: AppState, route_name: &str) -> Response {
     // Resolve the requested route BEFORE acquiring a connection permit, so a bad request
     // doesn't consume a slot. Unknown route → 400, never a silent direct fallback.
-    let route_name = params.get("route").map(String::as_str).unwrap_or(DIRECT);
     let route = match state.cfg.routes.get(route_name) {
         Some(r) => r.clone(), // clones the Arc<Route>, not the Route
         None => {
