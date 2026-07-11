@@ -363,12 +363,17 @@ function wispUrl() {
  * Point bare-mux at our Wisp backend for the CURRENT route. Idempotent per URL: a route
  * change alters the URL, which forces a fresh setTransport (rebuilding the SharedWorker
  * transport and dropping the old WebSocket).
+ *
+ * The transport is the hybrid client (see static/hybrid/index.mjs): libcurl by default, with an
+ * automatic fall back to an insecure epoxy client for any host whose TLS certificate fails
+ * verification (curl error 60). Both dial this same Wisp backend, so the URL logic is unchanged.
  */
+const TRANSPORT = "/hybrid/index.mjs";
 let activeWispUrl = null;
 async function ensureTransport() {
   const url = wispUrl();
-  if ((await connection.getTransport()) !== "/libcurl/index.mjs" || activeWispUrl !== url) {
-    await connection.setTransport("/libcurl/index.mjs", [{ websocket: url }]);
+  if ((await connection.getTransport()) !== TRANSPORT || activeWispUrl !== url) {
+    await connection.setTransport(TRANSPORT, [{ websocket: url }]);
     activeWispUrl = url;
   }
 }

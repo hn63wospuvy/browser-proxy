@@ -23,6 +23,12 @@ Browser                                             Rust server (axum + tokio)
 Because HTTP and TLS run in the browser (inside the libcurl WASM), the Rust server never
 parses HTTP — it just relays raw TCP bytes, so it streams by default and stays fast.
 
+The client transport is actually a small **hybrid** ([`static/hybrid/index.mjs`](static/hybrid/index.mjs)):
+libcurl by default (verifies TLS certificates), and — only for a host whose certificate fails
+verification — an automatic per-request fall back to an **epoxy** client with verification
+disabled, so cert-broken sites still load. See
+[the design spec](docs/superpowers/specs/2026-07-11-insecure-tls-fallback-design.md).
+
 ## Requirements
 
 - **Rust** 1.75+ (`cargo`) to build and run the server.
@@ -31,7 +37,7 @@ parses HTTP — it just relays raw TCP bytes, so it streams by default and stays
 ## Setup
 
 ```bash
-# 1. Vendor the Scramjet / bare-mux / libcurl client assets into static/
+# 1. Vendor the Scramjet / bare-mux / libcurl / epoxy client assets into static/
 node scripts/fetch-assets.mjs
 
 # 2. Build and run
@@ -202,9 +208,9 @@ Both selections and history live entirely in the browser; only the chosen route 
 ## How it works
 
 1. The frontend registers the Scramjet **service worker** (scope `/`) and points
-   [bare-mux](https://github.com/MercuryWorkshop/bare-mux) at the **libcurl** transport,
-   which speaks the [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) protocol to
-   `wss://<host>/wisp/`.
+   [bare-mux](https://github.com/MercuryWorkshop/bare-mux) at the **hybrid** transport
+   (libcurl + an insecure-TLS epoxy fallback, see above), which speaks the
+   [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) protocol to `wss://<host>/wisp/`.
 2. Pressing Go renders the proxied site in a **full-viewport iframe** via
    `scramjet.createFrame()`. The frontend page must stay alive because it hosts the libcurl
    transport (in the bare-mux SharedWorker); a top-level navigation would tear it down and
@@ -256,7 +262,9 @@ cargo test -- --ignored         # also runs the real-internet relay test (needs 
 ## Credits
 
 Client interception by [Scramjet](https://github.com/MercuryWorkshop/scramjet),
-[bare-mux](https://github.com/MercuryWorkshop/bare-mux), and
-[libcurl-transport](https://github.com/ading2210/libcurl.js) from Mercury Workshop.
+[bare-mux](https://github.com/MercuryWorkshop/bare-mux),
+[libcurl-transport](https://github.com/ading2210/libcurl.js), and
+[epoxy-tls](https://github.com/MercuryWorkshop/epoxy-tls) (the insecure-TLS fallback) from
+Mercury Workshop.
 The Wisp backend here is an independent Rust implementation of the
 [Wisp v1 protocol](https://github.com/MercuryWorkshop/wisp-protocol/tree/v1).

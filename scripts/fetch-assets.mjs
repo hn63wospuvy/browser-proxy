@@ -1,5 +1,6 @@
-// Vendors the Scramjet client engine, bare-mux, and the libcurl transport into
-// ../static/{scram,libcurl,baremux}. Run once (or after bumping versions):
+// Vendors the Scramjet client engine, bare-mux, the libcurl transport, and the epoxy
+// (insecure-TLS fallback) transport into ../static/{scram,libcurl,baremux,epoxy}. Run once
+// (or after bumping versions):
 //
 //     node scripts/fetch-assets.mjs
 //
@@ -7,6 +8,7 @@
 
 import { execSync } from "node:child_process";
 import { cpSync, mkdirSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -37,5 +39,19 @@ for (const [name, src] of targets) {
   cpSync(src, dest, { recursive: true });
   console.log(`  ${name.padEnd(8)} <- ${src}`);
 }
+
+// epoxy ships no `path` export; its `.` entry resolves to full/epoxy-bundled.js — the full
+// build (HTTP/2 + WebSockets) with the WASM inlined, so a single self-contained ESM file is
+// vendored as static/epoxy/epoxy.js. Used only as the insecure-TLS fallback (see
+// static/hybrid/index.mjs); the primary path stays libcurl.
+const require = createRequire(import.meta.url);
+const epoxyBundled = require.resolve("@mercuryworkshop/epoxy-tls"); // -> full/epoxy-bundled.js
+const epoxyDir = dirname(epoxyBundled);
+const epoxyDest = join(staticDir, "epoxy");
+rmSync(epoxyDest, { recursive: true, force: true });
+mkdirSync(epoxyDest, { recursive: true });
+cpSync(epoxyBundled, join(epoxyDest, "epoxy.js"));
+cpSync(join(epoxyDir, "epoxy-bundled.d.ts"), join(epoxyDest, "epoxy.d.ts"));
+console.log(`  ${"epoxy".padEnd(8)} <- ${epoxyBundled}`);
 
 console.log("Done. Assets vendored into static/.");
