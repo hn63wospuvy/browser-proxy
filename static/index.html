@@ -13,21 +13,26 @@
     <link rel="stylesheet" href="/style.css" />
     <script src="/register-sw.js" defer></script>
     <script src="/search.js" defer></script>
+    <script src="/search-engines.js" defer></script>
+    <script src="/autocomplete.js" defer></script>
     <script src="/index.js" defer></script>
   </head>
   <body>
     <!-- Slim top bar: URL input, always available for navigating to a new site. -->
     <header id="bar">
       <form id="proxy-form" autocomplete="off">
-        <input
-          id="proxy-address"
-          type="text"
-          inputmode="url"
-          placeholder="Type a URL (example.com) or a search query"
-          aria-label="URL to proxy"
-          autofocus
-        />
-        <select id="proxy-route" aria-label="Route" hidden></select>
+        <!-- The input + its autocomplete dropdown share a positioning context. -->
+        <div class="ac-wrap">
+          <input
+            id="proxy-address"
+            type="text"
+            inputmode="url"
+            placeholder="Type a URL (example.com) or a search query"
+            aria-label="URL to proxy"
+            autofocus
+          />
+          <div id="ac-list" class="ac-list" role="listbox" hidden></div>
+        </div>
         <button type="submit">Go</button>
       </form>
       <span id="proxy-status" class="status"></span>
@@ -37,16 +42,37 @@
     <section id="landing">
       <h1>Browser Proxy</h1>
       <p>Type any URL above and browse it through this server.</p>
-      <label id="route-picker" hidden>
-        Route:
-        <select id="proxy-route-landing" aria-label="Route"></select>
-      </label>
+      <div class="pickers">
+        <label id="engine-picker">
+          Search:
+          <select id="proxy-engine-landing" aria-label="Search engine"></select>
+        </label>
+        <label id="dns-picker">
+          DNS:
+          <input
+            id="proxy-dns-landing"
+            list="dns-presets"
+            aria-label="DNS server (preset name or IP)"
+            placeholder="system or e.g. 1.1.1.1"
+            spellcheck="false"
+            autocomplete="off"
+          />
+          <datalist id="dns-presets"></datalist>
+        </label>
+        <label id="route-picker" hidden>
+          Route:
+          <select id="proxy-route-landing" aria-label="Route"></select>
+        </label>
+      </div>
       <p id="proxy-error" class="error"></p>
       <pre id="proxy-error-code" class="error-code"></pre>
     </section>
 
     <!-- The proxied site renders in this full-viewport frame. -->
     <main id="frame-host"></main>
+
+    <!-- Dim panel flashed on Esc; shows the current Route / Search / DNS, then fades out. -->
+    <div id="config-flash" class="config-flash" aria-hidden="true"></div>
 
     <!-- Transient hint shown when the bar hides. -->
     <div id="hint">Nhấn <kbd>Esc</kbd> để ẩn/hiện thanh địa chỉ</div>

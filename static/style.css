@@ -73,32 +73,32 @@ input:focus {
   border-color: var(--accent);
 }
 
-#proxy-route {
-  padding: 0.55rem 0.6rem;
-  font-size: 0.9rem;
-  color: var(--fg);
-  background: var(--field);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  outline: none;
-  cursor: pointer;
+/* Prominent pickers on the landing page (before browsing). */
+.pickers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem 1.25rem;
+  margin-top: 1.25rem;
 }
 
-#proxy-route:focus {
-  border-color: var(--accent);
-}
-
-/* Prominent route picker on the landing page (before browsing). */
-#route-picker {
+.pickers label {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  margin-top: 1.25rem;
   font-size: 1rem;
   color: var(--muted, #9aa4b2);
 }
 
-#route-picker select {
+/* The explicit display above would otherwise defeat the `hidden` attribute — restore it so a
+   picker with nothing to choose (e.g. only the `direct` route) stays hidden. */
+.pickers label[hidden] {
+  display: none;
+}
+
+.pickers select,
+.pickers input {
   padding: 0.5rem 0.75rem;
   font-size: 1rem;
   color: var(--fg);
@@ -108,8 +108,60 @@ input:focus {
   cursor: pointer;
 }
 
-#route-picker select:focus {
+.pickers select:focus,
+.pickers input:focus {
   border-color: var(--accent);
+  outline: none;
+}
+
+/* The DNS combobox is a free-text field (preset name or IP); give it room and a text cursor. */
+.pickers input {
+  width: 12rem;
+  cursor: text;
+}
+
+/* A typed value that's neither a known preset nor a valid IP. */
+.pickers input.invalid {
+  border-color: var(--error);
+}
+
+/* Input + autocomplete dropdown share this positioning context; it flexes like the old input. */
+.ac-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+/* Autocomplete suggestions, anchored under the input. */
+.ac-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 40;
+  max-height: 320px;
+  overflow-y: auto;
+  background: #12151cf7;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px #0009;
+  backdrop-filter: blur(6px);
+}
+
+.ac-item {
+  padding: 0.5rem 0.8rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ac-item:hover,
+.ac-item.active {
+  background: #2a3350;
 }
 
 button {
@@ -223,4 +275,52 @@ body.browsing #frame-host {
   background: var(--field);
   border: 1px solid var(--border);
   border-radius: 5px;
+}
+
+/* Dim config panel flashed on Esc (center of the viewport), fading out over ~1s. */
+.config-flash {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 35;
+  min-width: 220px;
+  padding: 0.9rem 1.25rem;
+  background: #12151ceb;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 10px 40px #000a;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Each Esc press restarts this: appear dim, then fade to nothing over 1s. */
+.config-flash.show {
+  animation: config-flash-fade 1s ease forwards;
+}
+
+@keyframes config-flash-fade {
+  from {
+    opacity: 0.9;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.config-flash .cf-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 0.15rem 0;
+  font-size: 0.95rem;
+}
+
+.config-flash .cf-row span {
+  color: var(--muted);
+}
+
+.config-flash .cf-row b {
+  color: var(--fg);
+  font-weight: 600;
 }
