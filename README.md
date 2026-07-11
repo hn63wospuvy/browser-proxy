@@ -140,6 +140,9 @@ directly when a VPN route was requested.
 **DNS.** On a `socks5`/`http` route the hostname is handed to the proxy to resolve; on a
 `wireguard`/`warp` route it is resolved via `1.1.1.1` *inside* the tunnel; on a `tor` route it
 is resolved at the exit relay. Either way no DNS query for the destination leaves this machine.
+On the `direct` route the server resolves the hostname itself — by default via the OS resolver
+(`system`), or via a **DNS-over-HTTPS** resolver chosen with the address-bar **DNS** picker (see
+[Address bar](#address-bar-search-engine-dns-history) below).
 
 **Caveats within the "personal use" scope:**
 
@@ -167,6 +170,33 @@ is resolved at the exit relay. Either way no DNS query for the destination leave
 - The client transport is a **SharedWorker shared across all tabs** of the origin. Selecting
   a route affects every open tab, not just the current one. Use one tab at a time if you
   rely on per-tab routes.
+
+## Address bar (search engine, DNS, history)
+
+The top bar stays slim — just the input and **Go**. The config controls live on the **landing
+page** (shown before the first navigation): a route picker, a search-engine picker, and a DNS
+picker. Set them before navigating; the input also remembers what you type.
+
+- **Search engine** — when the input isn't a URL/host it's sent to the selected engine. Default
+  is **Brave** (proxy-friendly; Google tends to CAPTCHA proxied traffic). Client-side only.
+- **DNS** — how the **`direct`** route resolves hostnames. An editable combobox: pick a preset
+  (`system`, or DNS-over-HTTPS to `cloudflare` / `google` / `quad9` + any custom `dns:` entries
+  from `config.yaml`, see [`config.example.yaml`](config.example.yaml)), **or type a DNS-server
+  IP** (e.g. `1.1.1.1`, or a LAN resolver) to query it over plain UDP/TCP. `system` (or an empty
+  field) is the **non-interfering default** — no DNS override is sent, so the OS resolver is used
+  and VPN/proxy routes keep resolving at their own exit. Changing it rebuilds the transport and
+  reloads the page, like a route switch; it has no effect on proxied routes.
+  - A custom DNS is useful when your ISP **DNS-hijacks** a domain (you'll see a TLS cert error
+    for the wrong host — the ISP's block page). Note a hijacking ISP may also block by IP/port
+    53; a VPN route (`warp`/`tor`) is the more robust bypass.
+- **History + autocomplete** — submitted queries are saved in the browser (`localStorage`, most
+  recent first). Typing ≥2 characters shows matching past entries; ↑/↓ to highlight, Enter to
+  open, Esc to dismiss the list.
+- **Esc** — while browsing, toggles the address bar and briefly flashes the current
+  Route / Search / DNS before fading out.
+
+Both selections and history live entirely in the browser; only the chosen route and DNS name/IP
+(as URL path segments) reach the server.
 
 ## How it works
 
