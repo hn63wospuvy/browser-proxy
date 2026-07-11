@@ -12,11 +12,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::connect_async;
 
-/// Start the proxy with the built-in DNS presets; return its port.
+/// Start the proxy with the built-in DNS presets (SSRF guard off); return its port.
 async fn spawn_proxy() -> u16 {
+    spawn(false).await
+}
+
+/// Start the proxy with the given `block_private` setting; return its port.
+async fn spawn(block_private: bool) -> u16 {
     let cfg = Config {
         dns: dns::build_defaults().expect("build dns defaults"),
         default_dns: dns::DEFAULT_DNS.to_string(),
+        block_private,
         ..Config::default()
     };
     let app = build_router(Arc::new(cfg), "static");
@@ -78,6 +84,23 @@ async fn ip_dns_segment_upgrades_ok() {
         .expect("a bare-IP dns segment should upgrade");
     let bytes = ws.next().await.unwrap().unwrap().into_data();
     assert_eq!(bytes[0], 0x03, "first frame should be CONTINUE");
+}
+
+#[tokio::test]
+async fn private_dns_server_ip_blocked_when_block_private() {
+    let port = spawn(true).await;
+    // SSRF guard: with block_private on, a private DNS-server IP is refused before the upgrade.
+    let url = format!("ws://127.0.0.1:{port}/wisp/direct/192.168.1.1/");
+    assert!(
+        connect_async(url.as_str()).await.is_err(),
+        "a private dns-server IP must be blocked when block_private is on"
+    );
+    // A public DNS-server IP is still accepted.
+    let url = format!("ws://127.0.0.1:{port}/wisp/direct/1.1.1.1/");
+    assert!(
+        connect_async(url.as_str()).await.is_ok(),
+        "a public dns-server IP should still upgrade"
+    );
 }
 
 #[tokio::test]

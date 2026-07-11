@@ -128,6 +128,14 @@ async fn upgrade_wisp(
             if let Some(r) = state.cfg.dns.get(name) {
                 r.clone()
             } else if let Ok(ip) = name.parse::<std::net::IpAddr>() {
+                // A client-controlled DNS server IP is an SSRF vector — the server emits DNS
+                // queries to it. Gate it behind the same `block_private` guard used for targets:
+                // when enabled, refuse a private/loopback/link-local resolver. (Off by default;
+                // the tool binds loopback-only, so a LAN resolver like 192.168.1.1 is allowed.)
+                if state.cfg.block_private && crate::config::is_private_ip(&ip) {
+                    return (StatusCode::BAD_REQUEST, format!("dns server {ip} is blocked"))
+                        .into_response();
+                }
                 match crate::dns::build_ip_resolver(ip) {
                     Ok(r) => r,
                     Err(e) => {
