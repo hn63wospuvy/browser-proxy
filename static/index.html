@@ -35,7 +35,20 @@
         </div>
         <button type="submit">Go</button>
       </form>
+      <!-- While browsing, toggles a popover holding the same Route/DNS/Search controls. -->
+      <button
+        id="settings-toggle"
+        type="button"
+        class="icon-btn"
+        aria-label="Route / DNS / Search settings"
+        title="Route / DNS / Search"
+        hidden
+      >
+        ⚙
+      </button>
       <span id="proxy-status" class="status"></span>
+      <!-- The landing's .pickers panel is moved in here on the first navigation. -->
+      <div id="settings-popover" hidden></div>
     </header>
 
     <!-- Landing shown before the first navigation. -->

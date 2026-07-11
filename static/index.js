@@ -30,6 +30,14 @@ const acContainer = document.getElementById("ac-list");
 const configFlash = document.getElementById("config-flash");
 let autocomplete = null; // set once the DOM refs exist (see below)
 
+// Mid-browse settings: a ⚙ button reveals a popover holding the SAME config controls. The
+// landing's `.pickers` panel is reparented into the popover on the first navigation (one set of
+// controls — no mirroring), so changing route/DNS while browsing rebuilds the transport + reloads.
+const settingsToggle = document.getElementById("settings-toggle");
+const settingsPopover = document.getElementById("settings-popover");
+const pickers = document.querySelector(".pickers");
+let pickersMoved = false;
+
 function fillSelect(sel, routes, value) {
   sel.replaceChildren();
   for (const name of routes) {
@@ -262,12 +270,44 @@ function showConfigFlash() {
 // Reachable from the injected in-frame Esc listener.
 window.__configFlash = showConfigFlash;
 
+// --- Mid-browse settings popover ---
+
+const settingsOpen = () => settingsPopover && !settingsPopover.hidden;
+function closeSettings() {
+  if (settingsPopover) settingsPopover.hidden = true;
+}
+// Move the landing's config controls into the bar popover on the first navigation, and reveal ⚙.
+function movePickersToPopover() {
+  if (pickersMoved || !pickers || !settingsPopover) return;
+  settingsPopover.appendChild(pickers);
+  settingsToggle.hidden = false;
+  pickersMoved = true;
+}
+if (settingsToggle) {
+  settingsToggle.addEventListener("click", (e) => {
+    e.stopPropagation();
+    settingsPopover.hidden = !settingsPopover.hidden;
+  });
+}
+// Click outside the popover (and not on the toggle) closes it.
+document.addEventListener("click", (e) => {
+  if (settingsOpen() && !settingsPopover.contains(e.target) && e.target !== settingsToggle) {
+    closeSettings();
+  }
+});
+
 function onHotkey(e) {
   if (!isToggleKey(e)) return;
-  // Precedence: an open autocomplete dropdown swallows Esc (just close it).
+  // Precedence: an open autocomplete dropdown swallows Esc (just close it)...
   if (autocomplete && autocomplete.isOpen()) {
     e.preventDefault();
     autocomplete.close();
+    return;
+  }
+  // ...then an open settings popover...
+  if (settingsOpen()) {
+    e.preventDefault();
+    closeSettings();
     return;
   }
   if (document.body.classList.contains("browsing")) {
@@ -357,6 +397,7 @@ form.addEventListener("submit", async (event) => {
     }
     // Reveal the frame, hide the landing, then fade the bar out (with a hint).
     document.body.classList.add("browsing");
+    movePickersToPopover(); // config controls now live in the ⚙ popover
     statusEl.textContent = "";
     frame.__lastTarget = target; // remembered so a route switch can reload this URL
     frame.go(target);

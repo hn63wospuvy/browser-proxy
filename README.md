@@ -173,9 +173,10 @@ On the `direct` route the server resolves the hostname itself — by default via
 
 ## Address bar (search engine, DNS, history)
 
-The top bar stays slim — just the input and **Go**. The config controls live on the **landing
-page** (shown before the first navigation): a route picker, a search-engine picker, and a DNS
-picker. Set them before navigating; the input also remembers what you type.
+The top bar stays slim — just the input and **Go**. The config controls (route, search engine,
+DNS) live on the **landing page** shown before the first navigation. Once you're browsing, the
+same controls move into a **⚙ popover** in the bar, so you can switch route/DNS mid-browse — e.g.
+flip to a `warp`/`tor` route the moment a site is blocked. The input also remembers what you type.
 
 - **Search engine** — when the input isn't a URL/host it's sent to the selected engine. Default
   is **Brave** (proxy-friendly; Google tends to CAPTCHA proxied traffic). Client-side only.
