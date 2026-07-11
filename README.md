@@ -24,9 +24,10 @@ Because HTTP and TLS run in the browser (inside the libcurl WASM), the Rust serv
 parses HTTP — it just relays raw TCP bytes, so it streams by default and stays fast.
 
 The client transport is actually a small **hybrid** ([`static/hybrid/index.mjs`](static/hybrid/index.mjs)):
-libcurl by default (verifies TLS certificates), and — only for a host whose certificate fails
-verification — an automatic per-request fall back to an **epoxy** client with verification
-disabled, so cert-broken sites still load. See
+libcurl by default (verifies TLS certificates), and — for a host whose certificate fails
+verification — a fall back to an **epoxy** client with verification disabled, **gated behind a
+per-host consent prompt** (deny by default; approved sites show a persistent 🔓 indicator). So a
+cert-broken site can still load, but only after you explicitly allow it. See
 [the design spec](docs/superpowers/specs/2026-07-11-insecure-tls-fallback-design.md).
 
 ## Requirements

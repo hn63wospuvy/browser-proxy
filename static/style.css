@@ -320,6 +320,101 @@ body.browsing #frame-host {
   border-radius: 5px;
 }
 
+/* --- Insecure-TLS: persistent badge + per-host consent modal --- */
+
+/* Persistent indicator that the current site is served over the unverified (epoxy) path.
+   Fixed bottom-left so it stays visible while browsing (independent of the fading bar) and
+   doesn't collide with the bottom-center hint. */
+.tls-badge {
+  position: fixed;
+  bottom: 18px;
+  left: 18px;
+  z-index: 45;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #ffd7cf;
+  background: #2a1512ee;
+  border: 1px solid var(--error);
+  border-radius: 999px;
+  box-shadow: 0 6px 24px #0008;
+  pointer-events: none;
+}
+
+.tls-badge[hidden] {
+  display: none;
+}
+
+/* Full-screen consent dialog, above the proxied frame and the bar. */
+.tls-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: #0009;
+  backdrop-filter: blur(3px);
+}
+
+.tls-modal[hidden] {
+  display: none;
+}
+
+.tls-dialog {
+  width: 100%;
+  max-width: 420px;
+  padding: 1.25rem 1.4rem;
+  background: var(--field);
+  border: 1px solid var(--error);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px #000b;
+}
+
+.tls-dialog h2 {
+  margin: 0 0 0.6rem;
+  font-size: 1.15rem;
+}
+
+.tls-dialog p {
+  margin: 0.35rem 0;
+  color: var(--fg);
+}
+
+.tls-dialog #tls-modal-host {
+  color: var(--error);
+  word-break: break-all;
+}
+
+.tls-modal-sub {
+  color: var(--muted) !important;
+  font-size: 0.9rem;
+}
+
+.tls-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 1.1rem;
+}
+
+/* Button variants for the dialog (the base `button` is the accent-colored primary). */
+.btn-secondary {
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  border-color: var(--muted);
+  filter: none;
+}
+
+.btn-danger {
+  background: var(--error);
+}
+
 /* Dim config panel flashed on Esc (center of the viewport), fading out over ~1s. */
 .config-flash {
   position: fixed;

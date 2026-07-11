@@ -28,14 +28,19 @@ this requires a TLS engine that does. The alternative Wisp transport **epoxy**
 (`@mercuryworkshop/epoxy-tls`, Rust + rustls in WASM) exposes
 `EpoxyClientOptions.disable_certificate_validation: boolean` — a first-class `curl -k`.
 
-## Goal / chosen behavior (from brainstorming)
+## Goal / chosen behavior
 
 Deploy **both** transports. Keep **libcurl as the default** (verified TLS, best site
 compatibility). When a request fails specifically with a **cert-verification error**, retry that
-request through **epoxy with `disable_certificate_validation: true`**. The epoxy path is
-**always insecure** (no per-session toggle); it is only ever reached as a fallback, so verified
-sites keep verified TLS and only cert-broken hosts get the unverified path. Automatic,
-per-request, no page reload, no new UI.
+request through **epoxy with `disable_certificate_validation: true`** — but only after the user
+grants **per-host consent**. Verified sites keep verified TLS; a host the user approves is
+remembered for the session and shown with a persistent **🔓 Insecure TLS** indicator; a host the
+user declines keeps failing with its cert error.
+
+> **Revision note.** The first cut auto-downgraded on any cert error with no prompt. An automated
+> security review flagged the silent downgrade; the user then chose the per-host consent gate
+> below (deny by default, explicit yes required, visible indicator). This section and the Security
+> section reflect that final design.
 
 ## Architecture
 
@@ -86,19 +91,36 @@ Default-exported class implementing the BareMux transport contract.
 - `request(remote, method, body, headers, signal)`:
   1. **Buffer `body` once** into a `Uint8Array` (a `ReadableStream` can only be read once; GET /
      navigations are null → no-op) so the request can be replayed on retry.
-  2. If `remote.host ∈ insecureHosts` → go straight to epoxy.
-  3. Else call libcurl. On success, return it. On a **cert-verification error**, add the host to
-     `insecureHosts` and retry via epoxy. **Any other error is rethrown unchanged** (fail like
-     today — we only relax TLS verification, nothing else).
-- `connect(url, …)` (WebSocket): if `url.host ∈ insecureHosts` → epoxy, else libcurl. libcurl's
-  WS wrapper surfaces no error code, so a WS can't self-detect a cert failure; but a page loads
-  its document over HTTP first, which marks the host insecure, so its `wss://` follows.
+  2. If `remote.host ∈ allowedHosts` (user already approved) → go straight to epoxy.
+  3. Else call libcurl. On success, return it. On a **cert-verification error**, `askConsent(host)`
+     (below); if approved → retry via epoxy, else **rethrow the cert error**. **Any other error is
+     rethrown unchanged** (we only relax TLS verification, nothing else).
+- `connect(url, …)` (WebSocket): if `url.host ∈ allowedHosts` → epoxy, else libcurl. libcurl's WS
+  wrapper surfaces no error code, so a WS can't self-detect a cert failure; but a page loads its
+  document over HTTP first, so an approved host's `wss://` follows (no separate prompt).
 - `meta()`: delegate to libcurl (no-op today).
 
-### 3. Wire-up — `static/index.js`
-One line: `ensureTransport()` calls `setTransport("/hybrid/index.mjs", …)` instead of
-`"/libcurl/index.mjs"`. The `activeWispUrl` guard compares against `/hybrid/index.mjs`. The
-`wispUrl()` route/DNS path logic is unchanged.
+### 3. Per-host consent protocol (transport ⇄ page)
+The transport runs in the bare-mux **SharedWorker** and can't show UI, so it asks the page over a
+`BroadcastChannel("hybrid-tls-consent")`:
+- `askConsent(host)`: `allowedHosts` → true, `deniedHosts` → false (both cached for the session);
+  a concurrent request to the same host shares one in-flight prompt. Otherwise it posts
+  `{type:"tls-ask", host}` and awaits `{type:"tls-answer", host, allow}`. **Fail closed:** if no
+  answer arrives within 60 s (page closed, race), the request fails without caching a denial.
+- Only an explicit answer caches the decision (`allowedHosts`/`deniedHosts`). Cross-tab: the first
+  answer wins; other tabs reflect it (BroadcastChannel doesn't echo the sender).
+
+### 4. Consent UI + indicator — `static/index.js`, `index.html`, `style.css`
+- On `tls-ask`, the page shows a themed **alertdialog** ("⚠️ Chứng chỉ TLS không hợp lệ" + host +
+  MITM warning + **Hủy** / **Tiếp tục (không an toàn)**), one host at a time (a small queue). It
+  posts the decision back and, on approve, records the host so a persistent **🔓 Insecure TLS**
+  badge (fixed, bottom-left) shows while that site is in the frame. Esc = cancel (deny). The Esc
+  config-flash also lists a `TLS: ⚠ insecure` row when applicable.
+
+### 5. Wire-up — `static/index.js`
+`ensureTransport()` calls `setTransport("/hybrid/index.mjs", …)` instead of `"/libcurl/index.mjs"`
+(the `activeWispUrl` guard compares against `/hybrid/index.mjs`). The `wispUrl()` route/DNS path
+logic is unchanged. `updateTlsBadge()` runs on each navigation.
 
 ## Cert-error detection
 
@@ -111,10 +133,13 @@ locale-stable.
 ## Data flow (the reported case, `vlxx.moi`)
 
 1. Document GET for `vlxx.moi` → hybrid → libcurl → mbedTLS rejects the cert → error 60.
-2. Hybrid adds `vlxx.moi` to `insecureHosts`, lazily inits epoxy, retries the GET via epoxy with
-   verification off → 200, document streams back.
-3. Each subresource on `vlxx.moi`: host already in `insecureHosts` → straight to epoxy (no
-   wasted failing libcurl attempt). Subresources on other, valid-cert hosts → libcurl (verified).
+2. Hybrid `askConsent("vlxx.moi")` → the page shows the dialog. If the user clicks **Tiếp tục**,
+   the host joins `allowedHosts`, epoxy lazily inits, and the GET retries via epoxy with
+   verification off → 200; the document streams back and the 🔓 badge appears.
+3. Each subresource on `vlxx.moi`: host already in `allowedHosts` → straight to epoxy (no wasted
+   failing libcurl attempt, no re-prompt). Other, valid-cert hosts → libcurl (verified).
+4. If the user clicks **Hủy**, `vlxx.moi` joins `deniedHosts` and every request to it surfaces the
+   cert error (Scramjet shows its error page); nothing goes over the insecure path.
 
 ## Error handling / edge cases
 
@@ -128,23 +153,29 @@ locale-stable.
 
 ## Security note (explicit)
 
-This **silently downgrades to unverified TLS** for any host whose certificate fails
-verification, enabling undetectable MITM against exactly those hosts. This is the user's
-explicit intent ("xử lý bằng mọi cách"), but it is a deliberate departure from the codebase's
-otherwise fail-closed posture (SSRF guard, blacklist, fail-closed DNS). Verified hosts are
-unaffected: they never touch the epoxy path.
+Disabling TLS verification enables undetectable MITM, so it is gated: the downgrade happens **only
+after an explicit per-host "yes"**, defaults to deny (fail closed on timeout/close), scopes the
+decision to the session, and marks every insecure page with a persistent 🔓 indicator. Verified
+hosts never touch the epoxy path. This keeps the feature the user asked for while respecting the
+codebase's otherwise fail-closed posture (SSRF guard, blacklist, fail-closed DNS) and resolves the
+automated review's "silent downgrade" finding.
 
 ## Testing / verification
 
 - `cargo build` — no Rust changes; confirms nothing broke.
-- Manual end-to-end via browser-harness against **badssl.com** (deterministic, no adult
-  content): `https://self-signed.badssl.com/` and `https://expired.badssl.com/` should load
-  (fallback fires), while `https://example.com/` still loads via libcurl (verified path intact).
-- Sanity that a normal site still works (libcurl primary path unregressed).
+- Helper unit tests (Node, against the real module source): cert-code detection, body buffering,
+  header normalization, and the epoxy→bare-mux response shape (object-with-array-values + stripped
+  encoding headers).
+- End-to-end via browser-harness against **badssl.com** (deterministic, no adult content):
+  - `self-signed.badssl.com` → dialog shows the host → **Tiếp tục** → page renders (`text/html`,
+    red bg) via epoxy, 🔓 badge visible.
+  - `expired.badssl.com` → **Hủy** → page does **not** load (Scramjet error), no badge.
+  - `example.com` → no dialog, renders via libcurl (verified), no badge.
 
 ## Out of scope / not done
 
-- No settings-UI toggle (chosen: always-insecure fallback).
 - No libcurl WASM rebuild (rejected: needs the emscripten/curl/mbedTLS toolchain).
 - No server-side TLS termination (rejected: breaks the raw-tunnel model, server would see
   plaintext).
+- Consent is session-scoped (transport-instance lifetime); no persistence across restarts, and a
+  route/DNS switch rebuilds the transport so an approved host is re-prompted on its next cert error.

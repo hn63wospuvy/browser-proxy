@@ -6,7 +6,10 @@
 // CURLE_PEER_FAILED_VERIFICATION — "SSL peer certificate or SSH remote key was not OK") can never
 // load. epoxy (rustls in WASM) does expose `disable_certificate_validation`, so we keep libcurl
 // as the verified default and, only when a request fails specifically on cert verification, retry
-// that request through an insecure epoxy client. Verified hosts never touch the epoxy path.
+// that request through an insecure epoxy client — but ONLY after the user grants per-host consent.
+// This transport runs in the bare-mux SharedWorker and can't show UI, so it asks the page over a
+// BroadcastChannel and waits for a decision (fail closed if none arrives). Verified hosts never
+// touch the epoxy path; a host the user declines keeps failing with its cert error.
 //
 // See docs/superpowers/specs/2026-07-11-insecure-tls-fallback-design.md.
 
@@ -16,6 +19,12 @@ import LibcurlClient from "/libcurl/index.mjs";
 // (and the one the user hit); 51 is its historical value on some builds. We match the numeric
 // code parsed from libcurl's error message, not the localized text, so this is locale-stable.
 const CERT_VERIFY_CODES = new Set([60, 51]);
+
+// Consent channel to the page (see static/index.js). The page shows a confirm dialog and posts
+// back {type:"tls-answer", host, allow}; we post {type:"tls-ask", host}. Fail closed if nobody
+// answers within the timeout (e.g. the page was closed) — never downgrade TLS without a yes.
+const CONSENT_CHANNEL = "hybrid-tls-consent";
+const CONSENT_TIMEOUT_MS = 60000;
 
 function isCertVerifyError(err) {
   const msg = err && err.message ? err.message : String(err);
@@ -83,9 +92,43 @@ export default class HybridTransport {
     this.epoxyMod = null; // the imported epoxy module (for EpoxyHandlers in connect())
     this.epoxy = null; // the constructed insecure EpoxyClient
     this.epoxyInit = null; // in-flight init promise, so concurrent callers share one init
-    this.insecureHosts = new Set(); // hosts whose cert failed verification this session
+
+    // Per-host TLS consent (session-scoped, i.e. this transport instance's lifetime).
+    this.allowedHosts = new Set(); // user approved the insecure path for these
+    this.deniedHosts = new Set(); // user rejected — keep failing, never go insecure
+    this.pendingConsent = new Map(); // host -> {promise, resolve, timer}: one in-flight prompt/host
+    this.consent = new BroadcastChannel(CONSENT_CHANNEL);
+    this.consent.onmessage = (e) => {
+      const d = e.data;
+      if (!d || d.type !== "tls-answer") return;
+      const entry = this.pendingConsent.get(d.host);
+      if (!entry) return; // already resolved (timeout, or another tab answered first)
+      clearTimeout(entry.timer);
+      this.pendingConsent.delete(d.host);
+      (d.allow ? this.allowedHosts : this.deniedHosts).add(d.host);
+      entry.resolve(!!d.allow);
+    };
 
     this.ready = false;
+  }
+
+  // Ask the page whether to proceed insecurely for `host`. Cached per host; concurrent requests
+  // to the same host share one prompt. A timeout fails closed for that request WITHOUT caching a
+  // denial (the user may have just been slow), so a later request re-asks.
+  askConsent(host) {
+    if (this.allowedHosts.has(host)) return Promise.resolve(true);
+    if (this.deniedHosts.has(host)) return Promise.resolve(false);
+    const existing = this.pendingConsent.get(host);
+    if (existing) return existing.promise;
+
+    let resolve;
+    const promise = new Promise((r) => (resolve = r));
+    const timer = setTimeout(() => {
+      if (this.pendingConsent.delete(host)) resolve(false);
+    }, CONSENT_TIMEOUT_MS);
+    this.pendingConsent.set(host, { promise, resolve, timer });
+    this.consent.postMessage({ type: "tls-ask", host });
+    return promise;
   }
 
   async init() {
@@ -135,9 +178,8 @@ export default class HybridTransport {
     const buffered = await bufferBody(body);
     const host = remote.host;
 
-    // Host already known to fail verification → skip the doomed libcurl attempt and its wasted
-    // round-trip; go straight to epoxy.
-    if (this.insecureHosts.has(host)) {
+    // Host already approved insecure → skip the doomed libcurl attempt and its wasted round-trip.
+    if (this.allowedHosts.has(host)) {
       return this.epoxyRequest(remote, method, buffered, headers);
     }
 
@@ -147,8 +189,10 @@ export default class HybridTransport {
       // Only relax TLS verification — every other failure (refused, timeout, DNS, HTTP status)
       // propagates unchanged, exactly as today.
       if (!isCertVerifyError(err)) throw err;
-      this.insecureHosts.add(host);
-      console.warn(`[hybrid] cert verification failed for ${host}; retrying insecurely via epoxy`);
+      // Never auto-downgrade: ask the user first. Declined (or no answer) → surface the cert error.
+      const allow = await this.askConsent(host);
+      if (!allow) throw err;
+      console.warn(`[hybrid] user approved insecure TLS for ${host}; retrying via epoxy`);
       return this.epoxyRequest(remote, method, buffered, headers);
     }
   }
@@ -161,9 +205,9 @@ export default class HybridTransport {
       /* leave host empty → never treated as insecure */
     }
     // libcurl's WebSocket surfaces no error code, so a wss:// can't self-detect a cert failure.
-    // But a page loads its document over HTTP first, which marks the host insecure, so its
-    // sockets to that host follow onto epoxy here.
-    if (this.insecureHosts.has(host)) {
+    // But a page loads its document over HTTP first; if the user approved that host's insecure
+    // path, its sockets to that host follow onto epoxy here (no separate prompt).
+    if (this.allowedHosts.has(host)) {
       return this.epoxyConnect(url, protocols, requestHeaders, onopen, onmessage, onclose, onerror);
     }
     return this.libcurl.connect(url, protocols, requestHeaders, onopen, onmessage, onclose, onerror);
@@ -172,7 +216,7 @@ export default class HybridTransport {
   epoxyConnect(url, protocols, requestHeaders, onopen, onmessage, onclose, onerror) {
     const headersObj = toHeaderObject(requestHeaders);
     // Defer handler construction + connect until epoxy is ready (it always is by the time a host
-    // is in insecureHosts, but this stays correct even if not). The send/close closures await the
+    // is in allowedHosts, but this stays correct even if not). The send/close closures await the
     // same promise.
     const wsPromise = this.ensureEpoxy().then((client) => {
       const handlers = new this.epoxyMod.EpoxyHandlers(

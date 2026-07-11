@@ -257,11 +257,17 @@ function showConfigFlash() {
   if (!configFlash) return;
   const route = !routePicker.hidden ? routeSelect.value : "direct";
   const dns = (dnsInput.value || "").trim() || dnsDefault;
-  configFlash.replaceChildren(
+  const rows = [
     flashRow("Route", route),
     flashRow("Search", engineLabel(currentEngine())),
-    flashRow("DNS", dns)
-  );
+    flashRow("DNS", dns),
+  ];
+  // Surface the insecure-TLS state too, when the current site is on the unverified path.
+  const host = currentTargetHost();
+  if (host && insecureHosts.has(host)) {
+    rows.push(flashRow("TLS", "⚠ insecure (không xác thực cert)"));
+  }
+  configFlash.replaceChildren(...rows);
   // Restart the fade animation: drop the class, force a reflow, re-add it.
   configFlash.classList.remove("show");
   void configFlash.offsetWidth;
@@ -296,8 +302,104 @@ document.addEventListener("click", (e) => {
   }
 });
 
+// --- Insecure-TLS: per-host consent dialog + persistent indicator ---
+//
+// The transport (static/hybrid/index.mjs) runs in the bare-mux SharedWorker and can't show UI, so
+// when a site's certificate fails verification it asks over the "hybrid-tls-consent"
+// BroadcastChannel. We prompt the user (one host at a time), reply with their decision, and — if
+// approved — remember the host to show a persistent "🔓 Insecure TLS" badge. Nothing goes over the
+// unverified path without an explicit yes.
+const tlsModal = document.getElementById("tls-modal");
+const tlsModalHost = document.getElementById("tls-modal-host");
+const tlsCancelBtn = document.getElementById("tls-cancel");
+const tlsProceedBtn = document.getElementById("tls-proceed");
+const tlsBadge = document.getElementById("tls-badge");
+const tlsConsent = new BroadcastChannel("hybrid-tls-consent");
+const insecureHosts = new Set(); // hosts the user approved (drives the indicator)
+const consentQueue = []; // hosts awaiting a prompt (one modal at a time)
+let consentHost = null; // host currently shown in the modal, or null
+
+function currentTargetHost() {
+  try {
+    return new URL(frame && frame.__lastTarget ? frame.__lastTarget : "").host;
+  } catch (_) {
+    return "";
+  }
+}
+
+// Show the "🔓 Insecure TLS" badge iff the site currently in the frame is on the unverified path.
+function updateTlsBadge() {
+  const host = currentTargetHost();
+  tlsBadge.hidden = !(host && insecureHosts.has(host));
+}
+window.__updateTlsBadge = updateTlsBadge;
+
+function processConsentQueue() {
+  if (consentHost || !consentQueue.length) return;
+  const host = consentQueue.shift();
+  if (insecureHosts.has(host)) return processConsentQueue(); // decided since queued
+  consentHost = host;
+  tlsModalHost.textContent = host;
+  tlsModal.hidden = false;
+  tlsProceedBtn.focus();
+}
+
+// Settle the current prompt: reply to the transport (and other tabs) and, if approved, remember
+// the host for the indicator. Exposed so the Esc handler can cancel (deny) an open dialog.
+function answerConsent(allow) {
+  if (!consentHost) return;
+  const host = consentHost;
+  consentHost = null;
+  tlsModal.hidden = true;
+  tlsConsent.postMessage({ type: "tls-answer", host, allow });
+  if (allow) {
+    insecureHosts.add(host);
+    updateTlsBadge();
+  }
+  processConsentQueue();
+}
+window.__tlsConsentActive = () => consentHost !== null;
+window.__tlsConsentCancel = () => answerConsent(false);
+
+function enqueueConsent(host) {
+  if (insecureHosts.has(host) || consentHost === host || consentQueue.includes(host)) return;
+  consentQueue.push(host);
+  processConsentQueue();
+}
+
+tlsProceedBtn.addEventListener("click", () => answerConsent(true));
+tlsCancelBtn.addEventListener("click", () => answerConsent(false));
+
+tlsConsent.onmessage = (e) => {
+  const d = e.data;
+  if (!d) return;
+  if (d.type === "tls-ask") {
+    enqueueConsent(d.host);
+  } else if (d.type === "tls-answer") {
+    // Another tab decided this host first (BroadcastChannel doesn't echo our own posts): reflect
+    // the decision and drop any prompt of ours still showing/queued for it.
+    if (d.allow) {
+      insecureHosts.add(d.host);
+      updateTlsBadge();
+    }
+    if (consentHost === d.host) {
+      consentHost = null;
+      tlsModal.hidden = true;
+      processConsentQueue();
+    }
+    const i = consentQueue.indexOf(d.host);
+    if (i >= 0) consentQueue.splice(i, 1);
+  }
+};
+
 function onHotkey(e) {
   if (!isToggleKey(e)) return;
+  // An open TLS consent dialog takes precedence — Esc cancels it (deny, the safe default).
+  if (consentHost) {
+    e.preventDefault();
+    answerConsent(false);
+    return;
+  }
   // Precedence: an open autocomplete dropdown swallows Esc (just close it)...
   if (autocomplete && autocomplete.isOpen()) {
     e.preventDefault();
@@ -406,6 +508,7 @@ form.addEventListener("submit", async (event) => {
     statusEl.textContent = "";
     frame.__lastTarget = target; // remembered so a route switch can reload this URL
     frame.go(target);
+    updateTlsBadge(); // reflect whether the new target host is on the insecure path
     setBarHidden(true);
   } catch (err) {
     statusEl.textContent = "";

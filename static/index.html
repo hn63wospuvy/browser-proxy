@@ -89,5 +89,38 @@
 
     <!-- Transient hint shown when the bar hides. -->
     <div id="hint">Nhấn <kbd>Esc</kbd> để ẩn/hiện thanh địa chỉ</div>
+
+    <!-- Persistent indicator: the current site is served with TLS verification disabled. -->
+    <div
+      id="tls-badge"
+      class="tls-badge"
+      hidden
+      title="Kết nối tới trang này KHÔNG xác thực chứng chỉ TLS (có thể bị nghe lén)"
+    >
+      🔓 Insecure TLS
+    </div>
+
+    <!-- Per-host consent dialog: shown when a site's TLS certificate fails verification. The
+         transport (bare-mux SharedWorker) asks over a BroadcastChannel before ever going insecure. -->
+    <div id="tls-modal" class="tls-modal" hidden>
+      <div
+        class="tls-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="tls-modal-title"
+        aria-describedby="tls-modal-desc"
+      >
+        <h2 id="tls-modal-title">⚠️ Chứng chỉ TLS không hợp lệ</h2>
+        <p id="tls-modal-desc">
+          Không xác thực được chứng chỉ của <b id="tls-modal-host"></b>. Kết nối tới trang này có
+          thể bị nghe lén hoặc giả mạo (MITM).
+        </p>
+        <p class="tls-modal-sub">Chỉ tiếp tục nếu bạn thực sự tin tưởng trang này.</p>
+        <div class="tls-actions">
+          <button type="button" id="tls-cancel" class="btn-secondary">Hủy</button>
+          <button type="button" id="tls-proceed" class="btn-danger">Tiếp tục (không an toàn)</button>
+        </div>
+      </div>
+    </div>
   </body>
 </html>
