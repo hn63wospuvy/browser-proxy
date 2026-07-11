@@ -27,6 +27,14 @@ smoltcp = { version = "0.11", default-features = false, features = ["std", "medi
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 rand = "0.8"
+# Embedded Tor route (in-process arti-client; no external tor/arti daemon).
+# Default features keep tokio + native-tls (schannel on Windows — no OpenSSL); onion-service-client
+# adds .onion support. With the tokio feature, arti's DataStream implements tokio's AsyncRead/Write
+# directly, so no futures<->tokio bridge crate is needed.
+# `static-sqlite` compiles SQLite from source (arti caches the Tor directory in SQLite) so no
+# system sqlite3 library is required to link.
+arti-client = { version = "0.44", features = ["onion-service-client", "static-sqlite"] }
+tor-rtcompat = "0.44"
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

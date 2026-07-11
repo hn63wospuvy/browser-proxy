@@ -89,8 +89,13 @@ routes:
     endpoint: "engage.cloudflareclient.com:2408"
     address: "172.16.0.2/32"
 
-  # A SOCKS5 upstream (Tor, or WARP in `warp-cli mode proxy`, etc.):
+  # Built-in Tor, running in-process (embedded arti-client — no external tor/arti daemon):
   - name: tor
+    type: tor
+    # data_dir: "arti-data"   # where arti caches consensus + keys (default: arti-data)
+
+  # A SOCKS5 upstream (an external Tor daemon, WARP in `warp-cli mode proxy`, etc.):
+  - name: socks
     type: socks5
     address: "127.0.0.1:9050"
 
@@ -114,8 +119,14 @@ in the UI.
 - **`wireguard`** — a generic WireGuard peer you supply. Use this with any WireGuard provider;
   for WARP without in-process registration, generate a config with
   [`wgcf`](https://github.com/ViRb3/wgcf) and paste the keys.
-- **`socks5`** — any SOCKS5 proxy (Tor on `127.0.0.1:9050`; WARP via `warp-cli mode proxy` on
-  `127.0.0.1:40000`; etc.).
+- **`tor`** — an embedded [Tor](https://www.torproject.org/) client, running in-process via
+  [`arti`](https://gitlab.torproject.org/tpo/core/arti) (the Tor Project's Rust implementation).
+  No external `tor` or `arti` daemon, no bundled per-OS binary — just one self-contained server.
+  Reaches clearnet **and `.onion`** addresses. Startup is *not* blocked on Tor; the Tor directory
+  bootstraps in the background, so the first request after boot may wait a few seconds for it to
+  finish. arti caches its consensus + keys under `data_dir` (default `arti-data/`).
+- **`socks5`** — any SOCKS5 proxy (an external Tor daemon on `127.0.0.1:9050`; WARP via
+  `warp-cli mode proxy` on `127.0.0.1:40000`; etc.).
 - **`http`** — any HTTP proxy that supports the CONNECT method.
 
 The `warp` and `wireguard` tunnels are userspace ([`boringtun`](https://github.com/cloudflare/boringtun)
@@ -127,8 +138,8 @@ do not touch the host routing table.
 directly when a VPN route was requested.
 
 **DNS.** On a `socks5`/`http` route the hostname is handed to the proxy to resolve; on a
-`wireguard`/`warp` route it is resolved via `1.1.1.1` *inside* the tunnel. Either way no DNS
-query for the destination leaves this machine.
+`wireguard`/`warp` route it is resolved via `1.1.1.1` *inside* the tunnel; on a `tor` route it
+is resolved at the exit relay. Either way no DNS query for the destination leaves this machine.
 
 **Caveats within the "personal use" scope:**
 
@@ -144,10 +155,15 @@ query for the destination leaves this machine.
 - Embedding WireGuard roughly **doubles the dependency tree and build time** (`boringtun`,
   `smoltcp`, `ureq`, and their transitive crates). If you only need `socks5`/`http` routes,
   the tunnel is still compiled in.
-- `BLOCK_PRIVATE` cannot filter a *hostname* on a `socks5`/`http`/`wireguard` route (the name
-  is resolved by the proxy or inside the tunnel, not here). IP-literal targets are still
-  checked. The SSRF exposure is smaller on a VPN route anyway, since connections originate
-  from the VPN's network, not this host.
+- The **embedded Tor route pulls in `arti`** — a large dependency tree (~200 crates, SQLite
+  bundled for arti's directory cache) that raises the minimum Rust toolchain to **1.91** and
+  adds noticeably to build time. The first request on a `tor` route after startup may take a
+  few seconds while the Tor directory finishes bootstrapping; a slow or failed bootstrap
+  degrades only that route — the server and other routes stay up.
+- `BLOCK_PRIVATE` cannot filter a *hostname* on a `socks5`/`http`/`wireguard`/`tor` route (the
+  name is resolved by the proxy, inside the tunnel, or at the Tor exit, not here). IP-literal
+  targets are still checked. The SSRF exposure is smaller on a VPN route anyway, since
+  connections originate from the VPN's network, not this host.
 - The client transport is a **SharedWorker shared across all tabs** of the origin. Selecting
   a route affects every open tab, not just the current one. Use one tab at a time if you
   rely on per-tab routes.

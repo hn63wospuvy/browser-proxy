@@ -20,8 +20,15 @@ routes:
   #   endpoint: "engage.cloudflareclient.com:2408"
   #   address: "172.16.0.2/32"
 
-  # A SOCKS5 upstream (Tor, etc.):
+  # Built-in Tor, running in-process (embedded arti-client — no external tor/arti daemon).
+  # Reaches clearnet and .onion. Startup is not blocked on Tor; the first request after boot
+  # may wait while the Tor directory bootstraps.
   - name: tor
+    type: tor
+    # data_dir: "arti-data"   # where arti caches consensus + keys (default: arti-data)
+
+  # An external SOCKS5 upstream (e.g. your own Tor daemon, or any SOCKS5 proxy):
+  - name: socks
     type: socks5
     address: "127.0.0.1:9050"
 

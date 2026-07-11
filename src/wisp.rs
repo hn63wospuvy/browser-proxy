@@ -346,6 +346,12 @@ async fn run_stream(
             if tcp_write.write_all(&chunk).await.is_err() {
                 break;
             }
+            // arti's Tor `DataStream` buffers writes and only sends on flush; for a real
+            // `TcpStream`/`WgStream` this flush is a no-op. Without it, a proxied request that
+            // fits in arti's buffer would never be sent.
+            if tcp_write.flush().await.is_err() {
+                break;
+            }
             outstanding.fetch_sub(1, Ordering::AcqRel);
             drained_since += 1;
             if drained_since >= refill_at {

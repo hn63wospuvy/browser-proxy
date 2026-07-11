@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -15,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::config::{is_private_ip, Config};
+use crate::tor::{self, TorClient};
 use crate::wireguard::{WgStream, WgTunnel};
 use crate::wisp::{R_BLOCKED, R_INVALID, R_REFUSED, R_TIMEOUT, R_UNREACHABLE};
 
@@ -37,6 +39,8 @@ pub enum Route {
     },
     /// Dial through an embedded WireGuard tunnel (shared, one per route).
     Wireguard(Arc<WgTunnel>),
+    /// Dial through an embedded, in-process Tor client (shared, one per route).
+    Tor(Arc<TorClient>),
 }
 
 // Manual Debug: never render credentials. Only the variant + proxy address are shown.
@@ -47,6 +51,7 @@ impl std::fmt::Debug for Route {
             Route::Socks5 { addr, .. } => write!(f, "Socks5({addr})"),
             Route::Http { addr, .. } => write!(f, "Http({addr})"),
             Route::Wireguard(_) => write!(f, "Wireguard"),
+            Route::Tor(_) => write!(f, "Tor"),
         }
     }
 }
@@ -56,6 +61,9 @@ impl std::fmt::Debug for Route {
 pub enum Conn {
     Tcp(TcpStream),
     Wg(WgStream),
+    /// A Tor stream. arti's `DataStream` implements tokio's io traits directly (tokio feature).
+    /// Boxed: `DataStream` is ~700 bytes, so keeping it inline would bloat every `Conn`.
+    Tor(Box<arti_client::DataStream>),
 }
 
 impl AsyncRead for Conn {
@@ -67,6 +75,7 @@ impl AsyncRead for Conn {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             Conn::Wg(s) => Pin::new(s).poll_read(cx, buf),
+            Conn::Tor(s) => Pin::new(&mut **s).poll_read(cx, buf),
         }
     }
 }
@@ -80,18 +89,21 @@ impl AsyncWrite for Conn {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             Conn::Wg(s) => Pin::new(s).poll_write(cx, buf),
+            Conn::Tor(s) => Pin::new(&mut **s).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_flush(cx),
             Conn::Wg(s) => Pin::new(s).poll_flush(cx),
+            Conn::Tor(s) => Pin::new(&mut **s).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             Conn::Wg(s) => Pin::new(s).poll_shutdown(cx),
+            Conn::Tor(s) => Pin::new(&mut **s).poll_shutdown(cx),
         }
     }
 }
@@ -136,6 +148,10 @@ enum RouteSpec {
     Warp {
         name: String,
     },
+    Tor {
+        name: String,
+        data_dir: Option<String>,
+    },
 }
 
 impl RouteSpec {
@@ -144,7 +160,8 @@ impl RouteSpec {
             RouteSpec::Socks5 { name, .. }
             | RouteSpec::Http { name, .. }
             | RouteSpec::Wireguard { name, .. }
-            | RouteSpec::Warp { name } => name,
+            | RouteSpec::Warp { name }
+            | RouteSpec::Tor { name, .. } => name,
         }
     }
 }
@@ -239,6 +256,12 @@ fn build_route(spec: RouteSpec, name: &str) -> Result<Route, String> {
                 .map_err(|e| format!("warp route {name:?}: {e}"))?;
             Ok(Route::Wireguard(WgTunnel::spawn(cfg)))
         }
+        RouteSpec::Tor { data_dir, .. } => {
+            let dir = PathBuf::from(data_dir.unwrap_or_else(|| "arti-data".to_string()));
+            let client =
+                tor::build_client(&dir).map_err(|e| format!("tor route {name:?}: {e}"))?;
+            Ok(Route::Tor(client))
+        }
     }
 }
 
@@ -258,6 +281,17 @@ impl Route {
                 .dial(host, port, cfg.connect_timeout)
                 .await
                 .map(Conn::Wg),
+            Route::Tor(client) => {
+                // The hostname is resolved at the exit relay, so `block_private` (a check on the
+                // locally-resolved IP) does not apply — same as the other proxied routes. The
+                // host blacklist is a name check, so it still applies.
+                if cfg.is_host_blacklisted(host) {
+                    return Err(R_BLOCKED);
+                }
+                tor::connect(client, host, port, cfg.connect_timeout)
+                    .await
+                    .map(|s| Conn::Tor(Box::new(s)))
+            }
         }
     }
 }
@@ -569,6 +603,7 @@ mod tests {
             Route::Socks5 { addr, .. } | Route::Http { addr, .. } => addr.to_string(),
             Route::Direct => "direct".into(),
             Route::Wireguard(_) => "wireguard".into(),
+            Route::Tor(_) => "tor".into(),
         }
     }
 
@@ -590,6 +625,26 @@ routes:
         assert!(matches!(&*m["tor"], Route::Socks5 { auth: None, .. }));
         assert!(matches!(&*m["corp"], Route::Http { auth: Some(_), .. }));
         assert!(m.contains_key(DIRECT));
+    }
+
+    #[test]
+    fn tor_route_spec_deserializes() {
+        // `type: tor` is a recognized type and `data_dir` defaults to None. Tested at the serde
+        // layer, not via routes_from_yaml, so no real TorClient is built (no state dir, no
+        // bootstrap) in the offline test suite.
+        let y = "routes:\n  - name: tor\n    type: tor\n";
+        let cfg: ConfigFile = serde_yaml_ng::from_str(y).unwrap();
+        assert_eq!(cfg.routes.len(), 1);
+        assert!(matches!(&cfg.routes[0], RouteSpec::Tor { data_dir: None, .. }));
+    }
+
+    #[test]
+    fn tor_route_spec_with_data_dir() {
+        let y = "routes:\n  - name: tor\n    type: tor\n    data_dir: \"custom-arti\"\n";
+        let cfg: ConfigFile = serde_yaml_ng::from_str(y).unwrap();
+        assert!(
+            matches!(&cfg.routes[0], RouteSpec::Tor { data_dir: Some(d), .. } if d == "custom-arti")
+        );
     }
 
     #[test]

@@ -12,6 +12,9 @@ scripts/package-lock.json
 /config.yaml
 /warp-*.json
 
+# Embedded Tor route: arti's directory cache + persistent state/keys
+/arti-data/
+
 # OS
 Thumbs.db
 .DS_Store
