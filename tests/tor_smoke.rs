@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use browser_proxy::config::Config;
+use browser_proxy::dns::DnsResolver;
 use browser_proxy::route::{Conn, Route};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -47,9 +48,12 @@ async fn tor_route_exits_from_a_different_ip_and_fails_closed() {
     let mut cfg = Config::default();
     cfg.connect_timeout = Duration::from_secs(30);
 
+    // The `direct` route resolves via this resolver; the Tor route ignores it (resolves at exit).
+    let resolver = DnsResolver::System;
+
     // Direct baseline: this host's real public IP.
     let mut d = Route::Direct
-        .connect(host, port, &cfg)
+        .connect(host, port, &cfg, &resolver)
         .await
         .expect("direct connect failed");
     let direct_ip = http_get_body(&mut d, host).await;
@@ -74,7 +78,7 @@ async fn tor_route_exits_from_a_different_ip_and_fails_closed() {
 
     let tor = Route::Tor(client);
     let mut t = tor
-        .connect(host, port, &cfg)
+        .connect(host, port, &cfg, &resolver)
         .await
         .expect("tor connect failed after bootstrap");
     let tor_ip = http_get_body(&mut t, host).await;
@@ -87,7 +91,7 @@ async fn tor_route_exits_from_a_different_ip_and_fails_closed() {
 
     // Fail-closed: a bogus host through Tor must error, not panic or hang.
     let bogus = tor
-        .connect("this-host-does-not-exist.invalid", 80, &cfg)
+        .connect("this-host-does-not-exist.invalid", 80, &cfg, &resolver)
         .await;
     assert!(bogus.is_err(), "bogus host through Tor should fail closed");
     println!("[smoke] fail-closed OK: bogus host returned {:?}\n", bogus.err());

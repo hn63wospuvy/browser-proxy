@@ -8,6 +8,7 @@
 //! - [`server`]: the axum HTTP router that serves the client assets and the `/wisp/` endpoint.
 
 pub mod config;
+pub mod dns;
 pub mod metrics;
 pub mod route;
 pub mod server;

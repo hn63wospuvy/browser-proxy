@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::dns::{self, DnsResolver, DEFAULT_DNS};
 use crate::route::{direct_routes, Route};
 
 /// Wisp per-stream flow-control window, in packets. The client may have at most this many
@@ -35,6 +36,11 @@ pub struct Config {
     pub host_blacklist: Vec<String>,
     /// Named outbound routes selectable via `?route=`. Always contains `direct`.
     pub routes: HashMap<String, Arc<Route>>,
+    /// Named DNS resolvers selectable via `?dns=` (applies to the `direct` route only). Always
+    /// contains `system` (the OS resolver) plus the built-in DoH presets.
+    pub dns: HashMap<String, Arc<DnsResolver>>,
+    /// DNS name used when a connection sends no `?dns=`. Defaults to `system`.
+    pub default_dns: String,
 }
 
 impl Default for Config {
@@ -52,6 +58,14 @@ impl Default for Config {
             block_private: false,
             host_blacklist: Vec::new(),
             routes: direct_routes(),
+            // Minimal, infallible default: only the OS resolver. `from_env` replaces this with
+            // the built-in DoH presets (+ any custom `dns:` entries).
+            dns: {
+                let mut m = HashMap::new();
+                m.insert(DEFAULT_DNS.to_string(), Arc::new(DnsResolver::System));
+                m
+            },
+            default_dns: DEFAULT_DNS.to_string(),
         }
     }
 }
@@ -96,6 +110,13 @@ impl Config {
             }
             cfg.routes =
                 crate::route::routes_from_yaml(body).map_err(|e| format!("{path}: {e}"))?;
+            let (dns, default_dns) = dns::dns_from_yaml(body).map_err(|e| format!("{path}: {e}"))?;
+            cfg.dns = dns;
+            cfg.default_dns = default_dns;
+        } else {
+            // No config file: still expose the built-in DoH presets alongside `system`.
+            cfg.dns = dns::build_defaults()?;
+            cfg.default_dns = DEFAULT_DNS.to_string();
         }
 
         if let Ok(bind) = std::env::var("BIND") {

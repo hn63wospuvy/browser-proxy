@@ -16,6 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::config::{is_private_ip, Config};
+use crate::dns::DnsResolver;
 use crate::tor::{self, TorClient};
 use crate::wireguard::{WgStream, WgTunnel};
 use crate::wisp::{R_BLOCKED, R_INVALID, R_REFUSED, R_TIMEOUT, R_UNREACHABLE};
@@ -267,10 +268,17 @@ fn build_route(spec: RouteSpec, name: &str) -> Result<Route, String> {
 
 impl Route {
     /// Open a connected stream to `host:port` according to this route.
-    /// On failure returns a Wisp close reason.
-    pub async fn connect(&self, host: &str, port: u16, cfg: &Config) -> Result<Conn, u8> {
+    /// On failure returns a Wisp close reason. `resolver` selects how the `direct` route
+    /// resolves the hostname; proxied routes resolve at their exit and ignore it.
+    pub async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        cfg: &Config,
+        resolver: &DnsResolver,
+    ) -> Result<Conn, u8> {
         match self {
-            Route::Direct => connect_direct(host, port, cfg).await.map(Conn::Tcp),
+            Route::Direct => connect_direct(host, port, cfg, resolver).await.map(Conn::Tcp),
             Route::Socks5 { addr, auth } => connect_socks5(*addr, auth.as_ref(), host, port, cfg)
                 .await
                 .map(Conn::Tcp),
@@ -296,15 +304,22 @@ impl Route {
     }
 }
 
-/// Resolve locally, honor the SSRF guard + blacklist, and connect. This is the logic that
-/// used to live in `wisp::connect_target`.
-async fn connect_direct(host: &str, port: u16, cfg: &Config) -> Result<TcpStream, u8> {
+/// Resolve (via the selected DNS resolver), honor the SSRF guard + blacklist, and connect.
+/// This is the logic that used to live in `wisp::connect_target`.
+async fn connect_direct(
+    host: &str,
+    port: u16,
+    cfg: &Config,
+    resolver: &DnsResolver,
+) -> Result<TcpStream, u8> {
     if cfg.is_host_blacklisted(host) {
         return Err(R_BLOCKED);
     }
 
-    let mut addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
-        Ok(it) => it.collect(),
+    // Fail-closed: a selected DoH resolver that can't resolve returns an error here — we never
+    // fall back to the OS resolver, which would defeat choosing a censorship-resistant DNS.
+    let mut addrs: Vec<SocketAddr> = match resolver.resolve(host, port).await {
+        Ok(a) => a,
         Err(_) => return Err(R_UNREACHABLE),
     };
     if cfg.block_private {

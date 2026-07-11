@@ -38,3 +38,22 @@ routes:
     address: "127.0.0.1:8080"
     # username: "u"
     # password: "p"
+
+# DNS resolution for the `direct` route only (socks5 / http / wireguard / tor routes resolve at
+# their own exit, so the UI's DNS picker doesn't affect them). The picker sends the chosen name
+# to the server as a path segment; the server resolves the target hostname with that resolver.
+#
+# Built-in resolvers, always present even without this section:
+#   system      the OS resolver (getaddrinfo) — the default, unchanged behavior
+#   cloudflare  DNS-over-HTTPS to Cloudflare  (1.1.1.1)
+#   google      DNS-over-HTTPS to Google      (8.8.8.8)
+#   quad9       DNS-over-HTTPS to Quad9       (9.9.9.9)
+#
+# Add custom DoH resolvers and/or change the preselected default:
+# dns:
+#   default: cloudflare          # which resolver is preselected (default: system)
+#   resolvers:
+#     - name: adguard
+#       addresses: ["94.140.14.14", "94.140.15.15"]   # IP(s) of the DoH endpoint
+#       url: "https://dns.adguard-dns.com/dns-query"   # DoH endpoint URL
+#       # sni: "dns.adguard-dns.com"   # optional TLS server name; defaults to the host in `url`

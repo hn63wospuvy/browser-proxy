@@ -16,6 +16,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
+use crate::dns::DnsResolver;
 use crate::route::DIRECT;
 use crate::{metrics, wisp};
 
@@ -43,14 +44,18 @@ pub fn build_router(cfg: Arc<Config>, static_dir: &str) -> Router {
     };
 
     Router::new()
-        // The route is a PATH segment, not a query param, so the WebSocket URL keeps its
+        // Route and DNS are PATH segments, not query params, so the WebSocket URL keeps its
         // trailing slash — the libcurl client rejects a URL that doesn't end in `/`.
+        // `/wisp/<route>/<dns>/` selects both; the shorter forms default DNS to `system`.
         .route("/wisp/", get(ws_handler_direct))
         .route("/wisp", get(ws_handler_direct))
         .route("/wisp/:route/", get(ws_handler_named))
         .route("/wisp/:route", get(ws_handler_named))
+        .route("/wisp/:route/:dns/", get(ws_handler_route_dns))
+        .route("/wisp/:route/:dns", get(ws_handler_route_dns))
         .route("/debug/stats", get(stats_handler))
         .route("/routes.json", get(routes_handler))
+        .route("/dns.json", get(dns_handler))
         .nest_service("/scram", sd("scram"))
         .nest_service("/baremux", sd("baremux"))
         .nest_service("/libcurl", sd("libcurl"))
@@ -75,21 +80,36 @@ fn header_layer(name: &'static str, value: &'static str) -> SetResponseHeaderLay
     )
 }
 
-/// `/wisp/` (and `/wisp`): the default `direct` route.
+/// `/wisp/` (and `/wisp`): the default `direct` route, default DNS.
 async fn ws_handler_direct(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    upgrade_wisp(ws, state, DIRECT).await
+    upgrade_wisp(ws, state, DIRECT, None).await
 }
 
-/// `/wisp/<route>/`: a named route selected by path segment.
+/// `/wisp/<route>/`: a named route selected by path segment, default DNS.
 async fn ws_handler_named(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     AxumPath(route): AxumPath<String>,
 ) -> Response {
-    upgrade_wisp(ws, state, &route).await
+    upgrade_wisp(ws, state, &route, None).await
 }
 
-async fn upgrade_wisp(ws: WebSocketUpgrade, state: AppState, route_name: &str) -> Response {
+/// `/wisp/<route>/<dns>/`: a named route plus an explicit DNS resolver, both by path segment.
+async fn ws_handler_route_dns(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    AxumPath((route, dns)): AxumPath<(String, String)>,
+) -> Response {
+    upgrade_wisp(ws, state, &route, Some(dns)).await
+}
+
+async fn upgrade_wisp(
+    ws: WebSocketUpgrade,
+    state: AppState,
+    route_name: &str,
+    dns_name: Option<String>,
+) -> Response {
+    tracing::debug!(route = %route_name, dns = ?dns_name, "wisp upgrade");
     // Resolve the requested route BEFORE acquiring a connection permit, so a bad request
     // doesn't consume a slot. Unknown route → 400, never a silent direct fallback.
     let route = match state.cfg.routes.get(route_name) {
@@ -98,6 +118,34 @@ async fn upgrade_wisp(ws: WebSocketUpgrade, state: AppState, route_name: &str) -
             return (StatusCode::BAD_REQUEST, format!("unknown route: {route_name}"))
                 .into_response();
         }
+    };
+
+    // Resolve the DNS selection: a preset name → that resolver; a bare IP → an on-the-fly UDP
+    // resolver for that server; anything else → 400 (fail-closed). An absent DNS segment uses the
+    // server default (`system` — the OS resolver, i.e. no interference).
+    let resolver: Arc<DnsResolver> = match &dns_name {
+        Some(name) => {
+            if let Some(r) = state.cfg.dns.get(name) {
+                r.clone()
+            } else if let Ok(ip) = name.parse::<std::net::IpAddr>() {
+                match crate::dns::build_ip_resolver(ip) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(dns = %name, error = %e, "failed to build IP resolver");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "dns resolver build failed")
+                            .into_response();
+                    }
+                }
+            } else {
+                return (StatusCode::BAD_REQUEST, format!("unknown dns: {name}")).into_response();
+            }
+        }
+        None => state
+            .cfg
+            .dns
+            .get(&state.cfg.default_dns)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(DnsResolver::System)),
     };
 
     // Reject the upgrade if we're already at the connection cap.
@@ -115,7 +163,7 @@ async fn upgrade_wisp(ws: WebSocketUpgrade, state: AppState, route_name: &str) -
         .on_upgrade(move |socket| async move {
             // Hold the permit for the whole connection; released when this future ends.
             let _permit = permit;
-            wisp::handle_connection(socket, cfg, route).await;
+            wisp::handle_connection(socket, cfg, route, resolver).await;
         })
 }
 
@@ -130,6 +178,25 @@ async fn routes_handler(State(state): State<AppState>) -> Response {
         .collect::<Vec<_>>()
         .join(",");
     let body = format!("{{\"routes\":[{items}]}}");
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+/// List the configured DNS resolver names as JSON, with the server default sorted first and
+/// echoed as `default` so the UI can preselect it. Mirrors `/routes.json`.
+async fn dns_handler(State(state): State<AppState>) -> Response {
+    let default = state.cfg.default_dns.as_str();
+    let mut names: Vec<&String> = state.cfg.dns.keys().collect();
+    names.sort_by(|a, b| (a.as_str() != default, a.as_str()).cmp(&(b.as_str() != default, b.as_str())));
+    let items = names
+        .iter()
+        .map(|n| format!("{n:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!("{{\"dns\":[{items}],\"default\":{default:?}}}");
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,

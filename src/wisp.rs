@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::config::Config;
+use crate::dns::DnsResolver;
 use crate::metrics;
 use crate::route::Route;
 
@@ -138,8 +139,14 @@ struct StreamHandle {
     outstanding: Arc<AtomicU32>,
 }
 
-/// Entry point: drive one Wisp connection to completion.
-pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>, route: Arc<Route>) {
+/// Entry point: drive one Wisp connection to completion. `resolver` is the DNS resolver chosen
+/// for this connection (via `?dns=`); it applies to the `direct` route's name resolution.
+pub async fn handle_connection(
+    socket: WebSocket,
+    cfg: Arc<Config>,
+    route: Arc<Route>,
+    resolver: Arc<DnsResolver>,
+) {
     metrics::inc(&metrics::connections_total);
     let (mut sink, mut ws_stream) = socket.split();
 
@@ -231,6 +238,7 @@ pub async fn handle_connection(socket: WebSocket, cfg: Arc<Config>, route: Arc<R
                             done_tx.clone(),
                             cfg.clone(),
                             route.clone(),
+                            resolver.clone(),
                             outstanding.clone(),
                         ));
                         streams.insert(
@@ -310,9 +318,10 @@ async fn run_stream(
     done_tx: mpsc::UnboundedSender<u32>,
     cfg: Arc<Config>,
     route: Arc<Route>,
+    resolver: Arc<DnsResolver>,
     outstanding: Arc<AtomicU32>,
 ) {
-    let conn = match route.connect(&host, port, &cfg).await {
+    let conn = match route.connect(&host, port, &cfg, &resolver).await {
         Ok(s) => {
             metrics::inc(&metrics::streams_connected);
             tracing::debug!(stream_id, host = %host, port, "connected");
