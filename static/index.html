@@ -84,6 +84,19 @@
     <!-- The proxied site renders in this full-viewport frame. -->
     <main id="frame-host"></main>
 
+    <!-- Fun loading animation over the frame while a proxied page loads (slow routes like Tor can
+         take a while). Shown on Go / in-frame navigation, hidden when the frame finishes loading. -->
+    <div id="loading" class="loading" hidden aria-hidden="true">
+      <div class="loader-orbit">
+        <span class="dot"></span>
+        <span class="dot"></span>
+        <span class="dot"></span>
+        <span class="core" id="loader-core">🌐</span>
+      </div>
+      <p class="loader-text">Đang tải <span id="loader-host" class="loader-host"></span></p>
+      <p class="loader-sub" id="loader-sub"></p>
+    </div>
+
     <!-- Dim panel flashed on Esc; shows the current Route / Search / DNS, then fades out. -->
     <div id="config-flash" class="config-flash" aria-hidden="true"></div>
 

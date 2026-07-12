@@ -287,6 +287,112 @@ body.browsing #frame-host {
   display: block;
 }
 
+/* --- Loading overlay: shown over the frame while a proxied page loads --- */
+
+.loading {
+  position: absolute;
+  inset: 0;
+  z-index: 15; /* above the frame, below the bar (20) so Esc still reveals the bar */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.25rem;
+  background: radial-gradient(circle at 50% 38%, #1a2030, var(--bg) 70%);
+  animation: loading-in 0.2s ease;
+}
+
+.loading[hidden] {
+  display: none;
+}
+
+@keyframes loading-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Three dots orbiting a bobbing emoji core. */
+.loader-orbit {
+  position: relative;
+  width: 110px;
+  height: 110px;
+}
+
+.loader-orbit .core {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 2.6rem;
+  animation: loader-bob 2.2s ease-in-out infinite;
+}
+
+.loader-orbit .dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 13px;
+  height: 13px;
+  margin: -6.5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 12px var(--accent);
+  animation: loader-orbit-spin 1.3s linear infinite;
+}
+
+.loader-orbit .dot:nth-child(2) {
+  animation-delay: -0.43s;
+  opacity: 0.66;
+}
+
+.loader-orbit .dot:nth-child(3) {
+  animation-delay: -0.86s;
+  opacity: 0.4;
+}
+
+@keyframes loader-orbit-spin {
+  from {
+    transform: rotate(0) translateX(50px) rotate(0);
+  }
+  to {
+    transform: rotate(360deg) translateX(50px) rotate(-360deg);
+  }
+}
+
+@keyframes loader-bob {
+  0%,
+  100% {
+    transform: translateY(-4px);
+  }
+  50% {
+    transform: translateY(4px);
+  }
+}
+
+.loader-text {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.loader-host {
+  color: var(--accent);
+  word-break: break-all;
+}
+
+.loader-sub {
+  margin: 0;
+  min-height: 1.3em;
+  font-size: 0.9rem;
+  color: var(--muted);
+  transition: opacity 0.3s ease;
+}
+
 /* Transient hint pill (bottom-center), fades in when the bar hides. */
 #hint {
   position: fixed;

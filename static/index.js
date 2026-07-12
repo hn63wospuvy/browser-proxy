@@ -82,7 +82,10 @@ async function onRouteChange(value) {
   if (!frame || !document.body.classList.contains("browsing")) return;
   try {
     await ensureTransport();
-    if (frame.__lastTarget) frame.go(frame.__lastTarget);
+    if (frame.__lastTarget) {
+      showLoading(frame.__lastTarget);
+      frame.go(frame.__lastTarget);
+    }
   } catch (err) {
     console.error("route switch failed", err);
   }
@@ -148,7 +151,10 @@ async function onDnsChange() {
   if (!frame || !document.body.classList.contains("browsing")) return;
   try {
     await ensureTransport();
-    if (frame.__lastTarget) frame.go(frame.__lastTarget);
+    if (frame.__lastTarget) {
+      showLoading(frame.__lastTarget);
+      frame.go(frame.__lastTarget);
+    }
   } catch (err) {
     console.error("dns switch failed", err);
   }
@@ -209,6 +215,95 @@ const connection = new BareMux.BareMuxConnection("/baremux/worker.js");
 // Reused across navigations so the transport/frame stay alive.
 let frame = null;
 
+// The real (unrewritten) URL of the page currently in the frame. Scramjet's `urlchange` event
+// carries the decoded URL on every top-frame navigation — a typed go(), an in-frame link click,
+// history back/forward, pushState — so we track it here to prefill the address bar when it's
+// revealed with Esc (letting the user see the current site and edit it to navigate elsewhere).
+let currentUrl = "";
+function trackUrlChange(e) {
+  if (e && e.url) currentUrl = e.url;
+}
+// Best guess at the page currently shown: the tracked urlchange value, else the live client URL
+// getter (decoded), else the last URL we explicitly navigated to.
+function currentFrameUrl() {
+  if (currentUrl) return currentUrl;
+  try {
+    if (frame && frame.url && frame.url.href) return frame.url.href;
+  } catch (_) {
+    /* the Scramjet client inside the frame isn't ready yet */
+  }
+  return (frame && frame.__lastTarget) || "";
+}
+
+// --- Loading overlay: a fun animation over the frame while a proxied page loads ---
+
+const loadingEl = document.getElementById("loading");
+const loaderCore = document.getElementById("loader-core");
+const loaderHost = document.getElementById("loader-host");
+const loaderSub = document.getElementById("loader-sub");
+
+// Playful status lines cycled while waiting. Tor is slow (relay hops), so it gets its own set.
+const LOAD_MSGS = [
+  "Đang định tuyến yêu cầu…",
+  "Đang thiết lập kết nối an toàn…",
+  "Đang tải nội dung…",
+  "Sắp xong rồi…",
+];
+const LOAD_MSGS_TOR = [
+  "Đang bóc từng lớp củ hành… 🧅",
+  "Đang nhảy qua các relay Tor…",
+  "Tor thường chậm hơn, kiên nhẫn chút nhé…",
+];
+
+let loadMsgTimer = null;
+let loadSafetyTimer = null;
+
+function loaderHostname(url) {
+  try {
+    return new URL(url).host || url;
+  } catch (_) {
+    return url || "";
+  }
+}
+
+// Reveal the animation, themed by the current route, and start cycling messages. A safety timer
+// hides it even if the frame's `load` never arrives (so a stray event can't strand the spinner).
+function showLoading(url) {
+  if (!loadingEl) return;
+  const isTor = /tor/i.test(currentRoute());
+  loaderCore.textContent = isTor ? "🧅" : "🌐";
+  loaderHost.textContent = loaderHostname(url);
+  const list = isTor ? LOAD_MSGS_TOR.concat(LOAD_MSGS) : LOAD_MSGS;
+  let i = 0;
+  loaderSub.textContent = list[0];
+  clearInterval(loadMsgTimer);
+  loadMsgTimer = setInterval(() => {
+    i = (i + 1) % list.length;
+    loaderSub.textContent = list[i];
+  }, 2500);
+  loadingEl.hidden = false;
+  clearTimeout(loadSafetyTimer);
+  loadSafetyTimer = setTimeout(hideLoading, 90000);
+}
+
+function hideLoading() {
+  if (!loadingEl) return;
+  loadingEl.hidden = true;
+  clearInterval(loadMsgTimer);
+  clearTimeout(loadSafetyTimer);
+}
+
+// The frame fires `load` for its initial about:blank too; ignore that so it doesn't hide the
+// spinner before the real page has even started.
+function onFrameLoad() {
+  try {
+    if (frame.frame.contentWindow && frame.frame.contentWindow.location.href === "about:blank") return;
+  } catch (_) {
+    /* cross-origin (shouldn't happen for our same-origin frame) — treat as a real load */
+  }
+  hideLoading();
+}
+
 // --- Top-bar visibility: fades out while browsing, toggled with Esc ---
 
 let hintTimer = null;
@@ -225,7 +320,11 @@ function setBarHidden(hidden) {
   if (hidden) {
     showHint();
   } else {
-    // Bar shown again: focus the URL box so a new destination can be typed.
+    // Bar shown again: drop the loading overlay (the user wants to type), then prefill the current
+    // page's real URL so it's visible and editable, focus and select it so typing replaces it.
+    hideLoading();
+    const url = currentFrameUrl();
+    if (url) address.value = url;
     address.focus();
     address.select();
   }
@@ -500,6 +599,13 @@ form.addEventListener("submit", async (event) => {
       frame = scramjet.createFrame();
       frame.frame.id = "sj-frame";
       frame.frame.addEventListener("load", injectFrameHotkey);
+      // Hide the loading overlay once the frame finishes loading a real page.
+      frame.frame.addEventListener("load", onFrameLoad);
+      // Track in-frame navigations (link clicks, history, pushState) so Esc always prefills the
+      // page you're actually on, not the URL you first typed.
+      frame.addEventListener("urlchange", trackUrlChange);
+      // Show the loader when an in-frame navigation (e.g. a link click) starts a new page load.
+      frame.addEventListener("navigate", (e) => showLoading((e && e.url) || frame.__lastTarget || ""));
       frameHost.appendChild(frame.frame);
     }
     // Reveal the frame, hide the landing, then fade the bar out (with a hint).
@@ -507,10 +613,13 @@ form.addEventListener("submit", async (event) => {
     movePickersToPopover(); // config controls now live in the ⚙ popover
     statusEl.textContent = "";
     frame.__lastTarget = target; // remembered so a route switch can reload this URL
+    currentUrl = target; // immediate value for Esc; urlchange refines it after any redirect
+    showLoading(target); // fun animation until the frame's `load` fires
     frame.go(target);
     updateTlsBadge(); // reflect whether the new target host is on the insecure path
     setBarHidden(true);
   } catch (err) {
+    hideLoading();
     statusEl.textContent = "";
     errorEl.textContent = "Failed to start the proxy.";
     errorCode.textContent = String(err && err.stack ? err.stack : err);
