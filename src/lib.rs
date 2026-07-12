@@ -7,6 +7,7 @@
 //! - [`wisp`]: the Wisp v1 server (multiplexed TCP-over-WebSocket relay).
 //! - [`server`]: the axum HTTP router that serves the client assets and the `/wisp/` endpoint.
 
+pub mod assets;
 pub mod config;
 pub mod dns;
 pub mod metrics;

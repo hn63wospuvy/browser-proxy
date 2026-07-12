@@ -142,7 +142,7 @@ async fn spawn_proxy_with_routes(yaml: &str) -> u16 {
         routes: routes_from_yaml(yaml).unwrap(),
         ..Default::default()
     };
-    let app = build_router(Arc::new(cfg), "static");
+    let app = build_router(Arc::new(cfg));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -253,7 +253,7 @@ async fn silent_proxy_times_out() {
             connect_timeout: Duration::from_secs(1), // short, so the test is fast
             ..Default::default()
         };
-        let app = build_router(Arc::new(cfg), "static");
+        let app = build_router(Arc::new(cfg));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = listener.local_addr().unwrap().port();
         tokio::spawn(async move {

@@ -25,7 +25,7 @@ async fn spawn(block_private: bool) -> u16 {
         block_private,
         ..Config::default()
     };
-    let app = build_router(Arc::new(cfg), "static");
+    let app = build_router(Arc::new(cfg));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {

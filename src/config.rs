@@ -17,8 +17,10 @@ pub const DEFAULT_BUFFER_SIZE: u32 = 128;
 pub struct Config {
     /// Address the HTTP/WebSocket server binds to.
     pub bind: SocketAddr,
-    /// Directory that holds the frontend + vendored client assets.
-    pub static_dir: String,
+    /// Optional on-disk override for the frontend + vendored client assets. `None` (the
+    /// default) serves the copy embedded in the binary; `Some(dir)` serves from that directory
+    /// instead — useful for iterating on the frontend without a rebuild.
+    pub static_dir: Option<String>,
     /// Wisp flow-control window (packets); also the per-stream intake bound.
     pub buffer_size: u32,
     /// Timeout for establishing an outbound TCP connection to a target.
@@ -49,7 +51,7 @@ impl Default for Config {
             // Loopback-only by default: the intended use is http://localhost, and this
             // keeps the auth-free relay off every LAN interface. Set BIND to expose it.
             bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
-            static_dir: "static".to_string(),
+            static_dir: None,
             buffer_size: DEFAULT_BUFFER_SIZE,
             connect_timeout: Duration::from_secs(15),
             idle_timeout: None,
@@ -74,7 +76,8 @@ impl Config {
     /// Build a config from environment variables, falling back to defaults.
     ///
     /// - `BIND` / `PORT`: bind address (default `127.0.0.1:8080`; `PORT` overrides just the port).
-    /// - `STATIC_DIR`: static asset directory (default `static`).
+    /// - `STATIC_DIR`: serve the frontend from this directory instead of the embedded copy
+    ///   (unset = serve the assets baked into the binary).
     /// - `WISP_BUFFER_SIZE`: flow-control window in packets (default 128).
     /// - `CONNECT_TIMEOUT_SECS`: outbound connect timeout (default 15).
     /// - `IDLE_TIMEOUT_SECS`: reap streams idle this long (default 0 = disabled).
@@ -133,7 +136,7 @@ impl Config {
             }
         }
         if let Ok(dir) = std::env::var("STATIC_DIR") {
-            cfg.static_dir = dir;
+            cfg.static_dir = Some(dir);
         }
         if let Some(v) = parse_env_u32("WISP_BUFFER_SIZE") {
             if v > 0 {

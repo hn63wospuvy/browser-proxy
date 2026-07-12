@@ -15,6 +15,10 @@ axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "set-header", "trace"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Embeds the `static/` frontend + vendored client assets into the binary at compile time, so a
+# release build is self-contained (no `static/` dir needs to ship alongside it). `mime-guess`
+# provides per-file content types. In debug builds it reads `static/` from disk (live edits).
+rust-embed = { version = "8", features = ["mime-guess", "include-exclude"] }
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

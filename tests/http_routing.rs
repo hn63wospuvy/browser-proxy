@@ -105,7 +105,7 @@ async fn spawn_proxy(yaml: &str) -> u16 {
         routes: routes_from_yaml(yaml).unwrap(),
         ..Default::default()
     };
-    let app = build_router(Arc::new(cfg), "static");
+    let app = build_router(Arc::new(cfg));
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
     tokio::spawn(async move {

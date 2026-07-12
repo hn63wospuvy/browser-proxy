@@ -33,19 +33,27 @@ cert-broken site can still load, but only after you explicitly allow it. See
 ## Requirements
 
 - **Rust** 1.75+ (`cargo`) to build and run the server.
-- **Node.js** 18+ (`npm`) — used **once** to vendor the client assets. Not needed at runtime.
+- **Node.js** 18+ (`npm`) — only to *refresh* the vendored client assets. The assets are already
+  committed, so a normal build/run needs no Node.
 
 ## Setup
 
-```bash
-# 1. Vendor the Scramjet / bare-mux / libcurl / epoxy client assets into static/
-node scripts/fetch-assets.mjs
+The client assets are committed to the repo and **embedded into the binary** at build time, so a
+release build is a single self-contained executable — copy it to another machine and run it, with
+no `static/` directory or Node install needed alongside.
 
-# 2. Build and run
+```bash
 cargo run --release
 ```
 
 Then open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press Go.
+
+To refresh the vendored client assets (e.g. after bumping their versions), re-run the Node
+script; the updated files are baked in by the next `cargo build`:
+
+```bash
+node scripts/fetch-assets.mjs
+```
 
 > Service workers require a *secure context*. Use `http://localhost` (browsers treat
 > localhost as secure) or put the server behind HTTPS. Plain `http://` on a LAN IP will not
@@ -57,7 +65,7 @@ Then open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press
 |---|---|---|
 | `BIND` | `127.0.0.1:8080` | Full bind address. Loopback-only by default; set e.g. `0.0.0.0:8080` to expose it. |
 | `PORT` | `8080` | Overrides just the port. |
-| `STATIC_DIR` | `static` | Directory of the frontend + vendored assets. |
+| `STATIC_DIR` | *(embedded)* | Serve the frontend from this directory instead of the copy embedded in the binary. Unset = use the embedded assets. |
 | `WISP_BUFFER_SIZE` | `128` | Wisp flow-control window (packets per stream); also the per-stream memory bound. |
 | `CONNECT_TIMEOUT_SECS` | `15` | Outbound TCP connect timeout. |
 | `IDLE_TIMEOUT_SECS` | `0` | Reap a stream whose target is silent this long. `0` disables it (keeps SSE/long-poll alive). |

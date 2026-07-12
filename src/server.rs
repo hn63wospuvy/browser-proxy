@@ -31,19 +31,30 @@ struct AppState {
     conn_sem: Arc<Semaphore>,
 }
 
-/// Assemble routes: `/wisp/` WebSocket, the three vendored asset trees, and the frontend
-/// as the fallback. Cross-origin-isolation headers are attached to every response.
-pub fn build_router(cfg: Arc<Config>, static_dir: &str) -> Router {
-    let sd = |sub: &str| {
-        ServeDir::new(Path::new(static_dir).join(sub)).append_index_html_on_directories(false)
-    };
+/// Assemble routes: `/wisp/` WebSocket plus the frontend + vendored asset trees as the
+/// fallback. Assets are served from the copy embedded in the binary; if `STATIC_DIR` points at
+/// an existing directory, they're served from there instead. Cross-origin-isolation headers are
+/// attached to every response.
+pub fn build_router(cfg: Arc<Config>) -> Router {
+    // Optional on-disk override: serve the frontend from STATIC_DIR when it names an existing
+    // directory (iterating without a rebuild); otherwise fall through to the embedded assets so
+    // a standalone binary needs no `static/` beside it.
+    let disk_override = cfg.static_dir.as_deref().and_then(|dir| {
+        let p = Path::new(dir);
+        if p.is_dir() {
+            Some(p.to_path_buf())
+        } else {
+            tracing::warn!("STATIC_DIR={dir:?} is not a directory; serving embedded assets");
+            None
+        }
+    });
 
     let state = AppState {
         conn_sem: Arc::new(Semaphore::new(cfg.max_connections)),
         cfg,
     };
 
-    Router::new()
+    let router = Router::new()
         // Route and DNS are PATH segments, not query params, so the WebSocket URL keeps its
         // trailing slash — the libcurl client rejects a URL that doesn't end in `/`.
         // `/wisp/<route>/<dns>/` selects both; the shorter forms default DNS to `system`.
@@ -55,11 +66,18 @@ pub fn build_router(cfg: Arc<Config>, static_dir: &str) -> Router {
         .route("/wisp/:route/:dns", get(ws_handler_route_dns))
         .route("/debug/stats", get(stats_handler))
         .route("/routes.json", get(routes_handler))
-        .route("/dns.json", get(dns_handler))
-        .nest_service("/scram", sd("scram"))
-        .nest_service("/baremux", sd("baremux"))
-        .nest_service("/libcurl", sd("libcurl"))
-        .fallback_service(ServeDir::new(static_dir))
+        .route("/dns.json", get(dns_handler));
+
+    // Anything not matched above is looked up as a static asset: from disk when overridden,
+    // otherwise from the embedded bundle. Both cover /scram, /baremux, /libcurl, and the root.
+    let router = match disk_override {
+        Some(dir) => {
+            router.fallback_service(ServeDir::new(dir).append_index_html_on_directories(false))
+        }
+        None => router.fallback(crate::assets::static_handler),
+    };
+
+    router
         // Cross-origin isolation: required so Scramjet/libcurl can use SharedArrayBuffer.
         .layer(header_layer("cross-origin-opener-policy", "same-origin"))
         .layer(header_layer("cross-origin-embedder-policy", "require-corp"))
@@ -218,16 +236,4 @@ async fn stats_handler() -> Response {
         metrics::snapshot_json(),
     )
         .into_response()
-}
-
-/// Log a clear hint if the vendored client assets have not been fetched yet.
-pub fn warn_if_assets_missing(static_dir: &str) {
-    let probe = Path::new(static_dir).join("scram").join("scramjet.all.js");
-    if !probe.exists() {
-        tracing::warn!(
-            "client assets not found at {}. Run `node scripts/fetch-assets.mjs` to vendor \
-             Scramjet/bare-mux/libcurl before use.",
-            probe.display()
-        );
-    }
 }

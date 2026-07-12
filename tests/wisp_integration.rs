@@ -73,7 +73,7 @@ async fn spawn_echo() -> u16 {
 /// Start the proxy router on an ephemeral port; return its port.
 async fn spawn_proxy() -> u16 {
     let cfg = Arc::new(Config::default());
-    let app = build_router(cfg, "static");
+    let app = build_router(cfg);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {

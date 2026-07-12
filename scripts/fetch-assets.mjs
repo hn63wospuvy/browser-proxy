@@ -4,7 +4,8 @@
 //
 //     node scripts/fetch-assets.mjs
 //
-// Node is only needed here; the running server is pure Rust and serves the copied files.
+// Node is only needed here; the copied files are committed to the repo and embedded into the
+// Rust binary at `cargo build` (see src/assets.rs), so the running server ships them itself.
 
 import { execSync } from "node:child_process";
 import { cpSync, mkdirSync, rmSync } from "node:fs";

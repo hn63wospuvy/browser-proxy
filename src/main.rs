@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use browser_proxy::config::Config;
-use browser_proxy::server::{build_router, warn_if_assets_missing};
+use browser_proxy::server::build_router;
 
 #[tokio::main]
 async fn main() {
@@ -21,11 +21,8 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let static_dir = cfg.static_dir.clone();
 
-    warn_if_assets_missing(&static_dir);
-
-    let app = build_router(cfg.clone(), &static_dir);
+    let app = build_router(cfg.clone());
 
     let listener = match tokio::net::TcpListener::bind(cfg.bind).await {
         Ok(l) => l,
