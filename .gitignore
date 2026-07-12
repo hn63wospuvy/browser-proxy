@@ -18,3 +18,5 @@ scripts/package-lock.json
 # OS
 Thumbs.db
 .DS_Store
+/docs/
+/.claude/
