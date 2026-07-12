@@ -43,6 +43,26 @@ pub struct Config {
     pub dns: HashMap<String, Arc<DnsResolver>>,
     /// DNS name used when a connection sends no `?dns=`. Defaults to `system`.
     pub default_dns: String,
+    /// TLS termination. `None` (default) serves plain HTTP. `Some(_)` serves HTTPS: with both
+    /// `cert` and `key` paths it uses those PEM files; with neither it generates a self-signed
+    /// cert at startup (localhost/dev only).
+    pub tls: Option<TlsSettings>,
+}
+
+/// Enabled-TLS settings. Absence of a value (`Config::tls == None`) means TLS is off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlsSettings {
+    /// Path to the PEM certificate chain. `None` (with `key` also `None`) → generate a
+    /// self-signed cert at startup.
+    pub cert: Option<String>,
+    /// Path to the PEM private key. `None` (with `cert` also `None`) → generate a self-signed
+    /// cert at startup.
+    pub key: Option<String>,
+    /// Extra SAN entries (IPs or domain names) for the self-signed cert generated when no
+    /// `cert`/`key` is given. `localhost`, `127.0.0.1`, and `::1` are always included; add your
+    /// public IP / hostname here so a browser reaching the server over it accepts the cert.
+    /// Ignored when `cert`/`key` are supplied.
+    pub hostnames: Vec<String>,
 }
 
 impl Default for Config {
@@ -68,6 +88,7 @@ impl Default for Config {
                 m
             },
             default_dns: DEFAULT_DNS.to_string(),
+            tls: None,
         }
     }
 }
@@ -85,6 +106,9 @@ impl Config {
     /// - `MAX_STREAMS`: max concurrent streams per connection (default 256).
     /// - `BLOCK_PRIVATE`: `1`/`true` to refuse private-range targets (default off).
     /// - `HOST_BLACKLIST`: comma-separated hostname substrings to refuse.
+    /// - `TLS`: `1`/`true` to serve HTTPS (default off = HTTP).
+    /// - `TLS_CERT` / `TLS_KEY`: PEM cert + key paths; set both, or neither to auto-generate.
+    /// - `TLS_HOSTNAMES`: comma-separated extra SAN hosts for the auto-generated cert.
     /// - `CONFIG`: path to a YAML config (default `config.yaml` if present). See
     ///   `config.example.yaml`. Holds the `bind` address (`interface` + `port`) and the
     ///   `routes` list. `BIND`/`PORT` env vars override the file's `bind`. A malformed config
@@ -116,6 +140,7 @@ impl Config {
             let (dns, default_dns) = dns::dns_from_yaml(body).map_err(|e| format!("{path}: {e}"))?;
             cfg.dns = dns;
             cfg.default_dns = default_dns;
+            cfg.tls = parse_tls(body).map_err(|e| format!("{path}: {e}"))?;
         } else {
             // No config file: still expose the built-in DoH presets alongside `system`.
             cfg.dns = dns::build_defaults()?;
@@ -172,6 +197,35 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+
+        // TLS env overrides (env always wins over the file, like BIND/PORT). `TLS` toggles HTTPS;
+        // `TLS_CERT` / `TLS_KEY` set the PEM paths (and imply enabled). Setting a path also
+        // materializes an enabled `TlsSettings` if the file didn't.
+        if let Ok(v) = std::env::var("TLS") {
+            match v.as_str() {
+                "1" | "true" | "TRUE" | "yes" => {
+                    cfg.tls.get_or_insert_with(TlsSettings::default);
+                }
+                "0" | "false" | "FALSE" | "no" => cfg.tls = None,
+                other => tracing::warn!("ignoring invalid TLS={other:?}"),
+            }
+        }
+        if let Ok(cert) = std::env::var("TLS_CERT") {
+            cfg.tls.get_or_insert_with(TlsSettings::default).cert = Some(cert);
+        }
+        if let Ok(key) = std::env::var("TLS_KEY") {
+            cfg.tls.get_or_insert_with(TlsSettings::default).key = Some(key);
+        }
+        if let Ok(list) = std::env::var("TLS_HOSTNAMES") {
+            cfg.tls.get_or_insert_with(TlsSettings::default).hostnames = list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(tls) = &cfg.tls {
+            validate_tls(tls)?;
+        }
         Ok(cfg)
     }
 
@@ -214,6 +268,56 @@ fn parse_bind(yaml: &str) -> Result<Option<SocketAddr>, String> {
         addr.set_port(port);
     }
     Ok(Some(addr))
+}
+
+/// The optional `tls:` section of the config file.
+#[derive(serde::Deserialize)]
+struct TlsFile {
+    tls: Option<TlsSpec>,
+}
+#[derive(serde::Deserialize)]
+struct TlsSpec {
+    /// Serve HTTPS when true. Defaults to false (plain HTTP).
+    enabled: Option<bool>,
+    /// PEM certificate chain path. Omit (with `key`) to auto-generate a self-signed cert.
+    cert: Option<String>,
+    /// PEM private key path. Omit (with `cert`) to auto-generate a self-signed cert.
+    key: Option<String>,
+    /// Extra SAN hosts (IPs / domains) for the auto-generated self-signed cert.
+    hostnames: Option<Vec<String>>,
+}
+
+/// Parse the `tls` section from the config file. Returns `None` when TLS is absent or disabled,
+/// `Some(settings)` when enabled. A half-configured pair (only `cert` or only `key`) is fatal.
+fn parse_tls(yaml: &str) -> Result<Option<TlsSettings>, String> {
+    let f: TlsFile =
+        serde_yaml_ng::from_str(yaml).map_err(|e| format!("config parse error: {e}"))?;
+    let Some(spec) = f.tls else {
+        return Ok(None);
+    };
+    // Disabled (or the field omitted) → plain HTTP.
+    if !spec.enabled.unwrap_or(false) {
+        return Ok(None);
+    }
+    let settings = TlsSettings {
+        cert: spec.cert,
+        key: spec.key,
+        hostnames: spec.hostnames.unwrap_or_default(),
+    };
+    validate_tls(&settings)?;
+    Ok(Some(settings))
+}
+
+/// Validate that `cert` and `key` are set together (both, so custom PEM files are used) or
+/// neither (auto-generate a self-signed cert). A lone one is a configuration error.
+fn validate_tls(s: &TlsSettings) -> Result<(), String> {
+    if s.cert.is_some() != s.key.is_some() {
+        return Err(
+            "tls: set both `cert` and `key`, or neither (to auto-generate a self-signed cert)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_env_u32(key: &str) -> Option<u32> {
@@ -326,6 +430,50 @@ mod tests {
         assert_eq!(iface_only.to_string(), "0.0.0.0:8080");
         // Bad interface is fatal.
         assert!(parse_bind("bind:\n  interface: \"not-an-ip\"\n").is_err());
+    }
+
+    #[test]
+    fn tls_absent_or_disabled_is_none() {
+        // No tls section at all.
+        assert_eq!(parse_tls("routes: []").unwrap(), None);
+        // Present but disabled.
+        assert_eq!(parse_tls("tls:\n  enabled: false\n").unwrap(), None);
+        // enabled defaults to false when the field is omitted.
+        assert_eq!(
+            parse_tls("tls:\n  cert: \"c.pem\"\n  key: \"k.pem\"\n").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn tls_enabled_without_paths_self_signs() {
+        let s = parse_tls("tls:\n  enabled: true\n").unwrap().unwrap();
+        assert_eq!(s.cert, None);
+        assert_eq!(s.key, None);
+        assert!(s.hostnames.is_empty());
+    }
+
+    #[test]
+    fn tls_hostnames_parsed() {
+        let s = parse_tls("tls:\n  enabled: true\n  hostnames: [\"10.0.0.5\", \"h.example\"]\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.hostnames, vec!["10.0.0.5".to_string(), "h.example".to_string()]);
+    }
+
+    #[test]
+    fn tls_enabled_with_both_paths() {
+        let s = parse_tls("tls:\n  enabled: true\n  cert: \"c.pem\"\n  key: \"k.pem\"\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.cert.as_deref(), Some("c.pem"));
+        assert_eq!(s.key.as_deref(), Some("k.pem"));
+    }
+
+    #[test]
+    fn tls_enabled_with_only_one_path_is_fatal() {
+        assert!(parse_tls("tls:\n  enabled: true\n  cert: \"c.pem\"\n").is_err());
+        assert!(parse_tls("tls:\n  enabled: true\n  key: \"k.pem\"\n").is_err());
     }
 
     #[test]

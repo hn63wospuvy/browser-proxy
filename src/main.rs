@@ -1,9 +1,13 @@
 //! Binary entry point. Serves the Scramjet client + the Rust Wisp backend.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use browser_proxy::config::Config;
 use browser_proxy::server::build_router;
+
+/// Grace period given to in-flight connections after a shutdown signal before they're dropped.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() {
@@ -24,7 +28,30 @@ async fn main() {
 
     let app = build_router(cfg.clone());
 
-    let listener = match tokio::net::TcpListener::bind(cfg.bind).await {
+    // Load the TLS config (if enabled) before binding, so a bad cert/key fails fast and loudly.
+    let tls_config = match &cfg.tls {
+        Some(tls) => {
+            if tls.cert.is_none() {
+                tracing::warn!(
+                    "TLS enabled without cert/key: generating a self-signed certificate for {:?} \
+                     (dev only — browsers will warn; import it as a trusted root, or set tls.cert/key)",
+                    tls.hostnames
+                );
+            }
+            match browser_proxy::tls::load_rustls_config(tls).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::error!("TLS setup failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Bind up front so a port conflict is an immediate, clear error (axum-server would otherwise
+    // surface it lazily from `serve`). `serve` sets the listener non-blocking itself.
+    let listener = match std::net::TcpListener::bind(cfg.bind) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("failed to bind {}: {e}", cfg.bind);
@@ -32,14 +59,39 @@ async fn main() {
         }
     };
 
-    tracing::info!("browser-proxy listening on http://{}", cfg.bind);
+    let scheme = if tls_config.is_some() { "https" } else { "http" };
+    tracing::info!("browser-proxy listening on {scheme}://{}", cfg.bind);
     tracing::info!(
-        "open http://localhost:{}/ (use localhost or https — service workers require a secure context)",
+        "open {scheme}://localhost:{}/ (service workers require a secure context — localhost or https)",
         cfg.bind.port()
     );
 
-    let server = axum::serve(listener, app);
-    if let Err(e) = server.with_graceful_shutdown(shutdown_signal()).await {
+    // Drive graceful shutdown through axum-server's Handle: on Ctrl-C / SIGTERM, stop accepting
+    // and give in-flight connections `SHUTDOWN_GRACE` to finish.
+    let handle = axum_server::Handle::new();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            shutdown_signal().await;
+            handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
+        }
+    });
+
+    let result = match tls_config {
+        Some(tls) => {
+            axum_server::from_tcp_rustls(listener, tls)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+        }
+        None => {
+            axum_server::from_tcp(listener)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+        }
+    };
+    if let Err(e) = result {
         tracing::error!("server error: {e}");
     }
 }

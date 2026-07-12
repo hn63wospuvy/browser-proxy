@@ -6,6 +6,26 @@ bind:
   interface: "127.0.0.1"   # IP to bind: 127.0.0.1 (loopback) or 0.0.0.0 to expose on the LAN
   port: 8080
 
+# TLS / HTTPS. Omit this section (or set `enabled: false`) to serve plain HTTP (the default).
+# Serving over HTTPS provides a "secure context" so service workers work from any host, not just
+# localhost. The TLS / TLS_CERT / TLS_KEY / TLS_HOSTNAMES env vars override these fields.
+tls:
+  enabled: false
+  # With both `cert` and `key` set, those PEM files are used. With neither, the server generates a
+  # fresh self-signed certificate at startup, covering localhost / 127.0.0.1 / ::1 plus the
+  # `hostnames` below.
+  # cert: "cert.pem"   # PEM certificate chain
+  # key:  "key.pem"    # PEM private key
+  #
+  # Extra SAN entries (IPs / domains) for the auto-generated cert — add the address you actually
+  # reach the server on so the browser's cert check matches. Ignored when cert/key are supplied.
+  # hostnames: ["103.78.1.236", "proxy.example.com"]
+  #
+  # The auto-generated cert is self-signed and DEV ONLY: it is regenerated on every start, so
+  # browsers show a certificate warning and it offers no protection against a man-in-the-middle.
+  # You must import it as a trusted root on each device (and re-import after a restart). For any
+  # real deployment, supply your own cert + key above (e.g. from Let's Encrypt).
+
 # Routes selectable from the UI. `direct` (no proxy) always exists implicitly.
 routes:
   # Cloudflare WARP, registered in-process (one binary, no warp-cli):

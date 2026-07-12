@@ -6,6 +6,7 @@
 //! - [`tor`]: embedded Tor route (in-process arti-client).
 //! - [`wisp`]: the Wisp v1 server (multiplexed TCP-over-WebSocket relay).
 //! - [`server`]: the axum HTTP router that serves the client assets and the `/wisp/` endpoint.
+//! - [`tls`]: optional HTTPS termination (operator PEM files or an auto-generated self-signed cert).
 
 pub mod assets;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod dns;
 pub mod metrics;
 pub mod route;
 pub mod server;
+pub mod tls;
 pub mod tor;
 pub mod wireguard;
 pub mod wisp;

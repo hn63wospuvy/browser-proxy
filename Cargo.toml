@@ -43,6 +43,14 @@ tor-rtcompat = "0.44"
 # `https-ring` = DoH over rustls with the ring provider (matches arti's TLS stack);
 # `webpki-roots` bundles the Mozilla root store so DoH cert validation needs no OS trust store.
 hickory-resolver = { version = "0.26", features = ["https-ring", "webpki-roots"] }
+# TLS termination (optional HTTPS). `tls-rustls-no-provider` keeps axum-server from pulling
+# aws-lc-rs (which needs a C toolchain / NASM on Windows); we install rustls' ring provider
+# ourselves. ring is already in the tree (arti + hickory DoH), so this adds no new crypto backend.
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Self-signed cert generated at startup when TLS is on with no cert/key. `ring` backend (not the
+# default aws-lc-rs) keeps the Windows build toolchain-free and reuses the provider already in-tree.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"
