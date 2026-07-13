@@ -20,16 +20,23 @@ import LibcurlClient from "/libcurl/index.mjs";
 // code parsed from libcurl's error message, not the localized text, so this is locale-stable.
 const CERT_VERIFY_CODES = new Set([60, 51]);
 
+// CURLE_SSL_CONNECT_ERROR: the TLS *handshake* failed (version/cipher/etc.) — distinct from a
+// certificate that verified as untrusted. libcurl-WASM's mbedTLS is less capable than epoxy's
+// rustls, so these frequently succeed — and verify the cert normally — when retried via epoxy.
+const SSL_CONNECT_CODE = 35;
+
 // Consent channel to the page (see static/index.js). The page shows a confirm dialog and posts
 // back {type:"tls-answer", host, allow}; we post {type:"tls-ask", host}. Fail closed if nobody
 // answers within the timeout (e.g. the page was closed) — never downgrade TLS without a yes.
 const CONSENT_CHANNEL = "hybrid-tls-consent";
 const CONSENT_TIMEOUT_MS = 60000;
 
-function isCertVerifyError(err) {
+// Numeric curl error code parsed from libcurl's message (e.g. "error code 35: ..."), or null.
+// Matched from the number, not localized text, so it's locale-stable.
+function curlErrorCode(err) {
   const msg = err && err.message ? err.message : String(err);
   const m = /error code (\d+)/.exec(msg);
-  return m ? CERT_VERIFY_CODES.has(Number(m[1])) : false;
+  return m ? Number(m[1]) : null;
 }
 
 // Read a request body once so a failed libcurl attempt can be replayed through epoxy. A
@@ -90,8 +97,13 @@ export default class HybridTransport {
     this.libcurl = new LibcurlClient(options);
 
     this.epoxyMod = null; // the imported epoxy module (for EpoxyHandlers in connect())
-    this.epoxy = null; // the constructed insecure EpoxyClient
-    this.epoxyInit = null; // in-flight init promise, so concurrent callers share one init
+    // Two epoxy clients from the same module: "secure" still verifies certs (retries a libcurl
+    // TLS-handshake failure, curl 35) and "insecure" disables verification (the consent fallback
+    // for a cert that failed verification, curl 60). Each is built + memoized on first use.
+    this.epoxySecure = null;
+    this.epoxyInsecure = null;
+    this.epoxyInitSecure = null; // in-flight init promises, so concurrent callers share one init
+    this.epoxyInitInsecure = null;
 
     // Per-host TLS consent (session-scoped, i.e. this transport instance's lifetime).
     this.allowedHosts = new Set(); // user approved the insecure path for these
@@ -138,33 +150,40 @@ export default class HybridTransport {
 
   async meta() {}
 
-  // Build the insecure epoxy client on first use only — keeps epoxy's ~1.7 MB out of startup for
-  // the common all-verified case. Memoized; the promise is cleared on failure so a transient
-  // error (network, wasm) doesn't permanently disable the fallback.
-  ensureEpoxy() {
-    if (this.epoxy) return Promise.resolve(this.epoxy);
-    if (!this.epoxyInit) {
-      this.epoxyInit = this.#initEpoxy().catch((e) => {
-        this.epoxyInit = null;
-        throw e;
-      });
+  // Build an epoxy client (secure or insecure) on first use only — keeps epoxy's ~1.7 MB out of
+  // startup for the common all-verified case. Memoized per mode; the promise is cleared on failure
+  // so a transient error (network, wasm) doesn't permanently disable the fallback.
+  ensureEpoxy(insecure) {
+    const clientKey = insecure ? "epoxyInsecure" : "epoxySecure";
+    const initKey = insecure ? "epoxyInitInsecure" : "epoxyInitSecure";
+    if (this[clientKey]) return Promise.resolve(this[clientKey]);
+    if (!this[initKey]) {
+      this[initKey] = this.#initEpoxy(insecure)
+        .then((client) => (this[clientKey] = client))
+        .catch((e) => {
+          this[initKey] = null;
+          throw e;
+        });
     }
-    return this.epoxyInit;
+    return this[initKey];
   }
 
-  async #initEpoxy() {
-    const epoxy = await import("/epoxy/epoxy.js");
-    await epoxy.default(); // __wbg_init — bundled build inlines the wasm, so no argument
-    const opts = new epoxy.EpoxyClientOptions();
+  async #initEpoxy(insecure) {
+    if (!this.epoxyMod) {
+      const epoxy = await import("/epoxy/epoxy.js");
+      await epoxy.default(); // __wbg_init — bundled build inlines the wasm, so no argument
+      this.epoxyMod = epoxy;
+    }
+    const opts = new this.epoxyMod.EpoxyClientOptions();
     opts.user_agent = navigator.userAgent;
-    opts.disable_certificate_validation = true; // curl -k: the entire reason epoxy is here
-    this.epoxyMod = epoxy;
-    this.epoxy = new epoxy.EpoxyClient(this.wisp, opts);
-    return this.epoxy;
+    // Insecure = curl -k, only for the per-host consent fallback. Secure keeps epoxy's default
+    // certificate verification (the retry path for a libcurl TLS-handshake failure).
+    if (insecure) opts.disable_certificate_validation = true;
+    return new this.epoxyMod.EpoxyClient(this.wisp, opts);
   }
 
-  async epoxyRequest(remote, method, body, headers) {
-    const client = await this.ensureEpoxy();
+  async epoxyRequest(remote, method, body, headers, insecure) {
+    const client = await this.ensureEpoxy(insecure);
     const res = await client.fetch(remote.href, {
       method,
       body: body ?? undefined,
@@ -180,20 +199,30 @@ export default class HybridTransport {
 
     // Host already approved insecure → skip the doomed libcurl attempt and its wasted round-trip.
     if (this.allowedHosts.has(host)) {
-      return this.epoxyRequest(remote, method, buffered, headers);
+      return this.epoxyRequest(remote, method, buffered, headers, true);
     }
 
     try {
       return await this.libcurl.request(remote, method, buffered, headers, signal);
     } catch (err) {
-      // Only relax TLS verification — every other failure (refused, timeout, DNS, HTTP status)
-      // propagates unchanged, exactly as today.
-      if (!isCertVerifyError(err)) throw err;
-      // Never auto-downgrade: ask the user first. Declined (or no answer) → surface the cert error.
+      const code = curlErrorCode(err);
+
+      // A libcurl TLS-handshake failure (not a cert problem): retry through epoxy's rustls, which
+      // still VERIFIES the certificate. No downgrade and no prompt — the page loads securely when
+      // epoxy's more capable TLS stack can complete a handshake mbedTLS couldn't.
+      if (code === SSL_CONNECT_CODE) {
+        console.warn(`[hybrid] libcurl TLS handshake failed for ${host} (code 35); retrying via epoxy (verified)`);
+        return this.epoxyRequest(remote, method, buffered, headers, false);
+      }
+
+      // A cert that failed verification: never auto-downgrade — ask the user first. Declined (or no
+      // answer) → surface the cert error. Every other failure (refused, timeout, DNS, HTTP status)
+      // propagates unchanged.
+      if (!CERT_VERIFY_CODES.has(code)) throw err;
       const allow = await this.askConsent(host);
       if (!allow) throw err;
       console.warn(`[hybrid] user approved insecure TLS for ${host}; retrying via epoxy`);
-      return this.epoxyRequest(remote, method, buffered, headers);
+      return this.epoxyRequest(remote, method, buffered, headers, true);
     }
   }
 
@@ -218,7 +247,7 @@ export default class HybridTransport {
     // Defer handler construction + connect until epoxy is ready (it always is by the time a host
     // is in allowedHosts, but this stays correct even if not). The send/close closures await the
     // same promise.
-    const wsPromise = this.ensureEpoxy().then((client) => {
+    const wsPromise = this.ensureEpoxy(true).then((client) => {
       const handlers = new this.epoxyMod.EpoxyHandlers(
         () => onopen(""),
         () => onclose(1000, "Closed by remote"),
