@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -133,7 +133,13 @@ pub fn register_warp(cache_path: &Path) -> Result<WgConfig, String> {
             return Ok(cfg);
         }
     }
+    register_fresh(cache_path)
+}
 
+/// Register a brand-new WARP account (ignoring any cache) and overwrite the cache with it.
+/// Used both for the first-ever registration and to self-heal when Cloudflare culls a device
+/// (a stale cached registration whose endpoint has stopped answering handshakes). Blocking.
+pub fn register_fresh(cache_path: &Path) -> Result<WgConfig, String> {
     let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let public = PublicKey::from(&secret);
 
@@ -320,6 +326,19 @@ enum Cmd {
     Close {
         handle: SocketHandle,
     },
+    /// Re-register WARP fresh and rebuild the tunnel session with new keys/endpoint. Replies
+    /// `Ok` once the new session is starting, `Err` if re-registration isn't possible or failed.
+    Reregister {
+        reply: oneshot::Sender<Result<(), ()>>,
+    },
+}
+
+/// How a single tunnel session ended, telling the driver's outer loop what to do next.
+enum SessionEnd {
+    /// The command channel closed (all `WgStream`s + the tunnel dropped) — stop the driver.
+    Shutdown,
+    /// A `Reregister` command arrived; the outer loop re-registers and starts a new session.
+    Reregister(oneshot::Sender<Result<(), ()>>),
 }
 
 /// Shared handle to a WireGuard tunnel. Cheap to clone (just the command sender).
@@ -330,17 +349,70 @@ pub struct WgTunnel {
 }
 
 impl WgTunnel {
-    /// Build the tunnel and start its driver task. Must be called inside a tokio runtime.
-    pub fn spawn(cfg: WgConfig) -> Arc<WgTunnel> {
+    /// Build the tunnel, start its driver task, and pre-connect it. Must be called inside a tokio
+    /// runtime. `reregister` is the WARP cache path for a WARP route — enabling self-heal if the
+    /// registration was culled — or `None` for a static WireGuard route (fixed keys, nothing to
+    /// re-register).
+    pub fn spawn(cfg: WgConfig, reregister: Option<PathBuf>) -> Arc<WgTunnel> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let address_v4 = cfg.address_v4;
         let self_tx = cmd_tx.clone();
+        let can_reregister = reregister.is_some();
         tokio::spawn(async move {
-            if let Err(e) = driver(cfg, cmd_rx, self_tx).await {
+            if let Err(e) = driver(cfg, cmd_rx, self_tx, reregister).await {
                 tracing::warn!("wireguard tunnel driver exited: {e}");
             }
         });
-        Arc::new(WgTunnel { cmd_tx, address_v4 })
+        let tunnel = Arc::new(WgTunnel { cmd_tx, address_v4 });
+
+        // Pre-connect: force the WireGuard handshake now so the first real request over this route
+        // isn't delayed by it (WARP/WG otherwise handshakes lazily on the first dial). Dialing
+        // 1.1.1.1:53 — reachable through the tunnel, and the resolver it already uses for DNS —
+        // drives boringtun's handshake to completion; the throwaway stream is dropped immediately.
+        let warm = Arc::clone(&tunnel);
+        tokio::spawn(async move {
+            let warm_dial = || warm.dial("1.1.1.1", 53, Duration::from_secs(10));
+            match warm_dial().await {
+                Ok(_) => tracing::info!("wireguard route pre-connected"),
+                // A WARP route that can't handshake is usually a culled registration (see
+                // register_fresh): re-register once and retry. A static WG route can't recover
+                // this way, so it just reports the failure.
+                Err(_) if can_reregister => {
+                    tracing::warn!(
+                        "wireguard route pre-connect failed; re-registering WARP \
+                         (the cached device may have been culled by Cloudflare)"
+                    );
+                    match warm.reregister().await {
+                        Ok(()) => match warm_dial().await {
+                            Ok(_) => tracing::info!("wireguard route re-registered and pre-connected"),
+                            Err(reason) => tracing::warn!(
+                                "wireguard route still unreachable after re-registration \
+                                 (wisp reason code {reason}); will retry on first real use"
+                            ),
+                        },
+                        Err(()) => tracing::warn!(
+                            "WARP re-registration failed; route will retry on first real use"
+                        ),
+                    }
+                }
+                Err(reason) => tracing::warn!(
+                    "wireguard route pre-connect warm-up failed (wisp reason code {reason}); \
+                     route will connect on first real use"
+                ),
+            }
+        });
+
+        tunnel
+    }
+
+    /// Ask the driver to re-register WARP fresh and rebuild the tunnel session. Resolves once the
+    /// new session is starting (or `Err` if re-registration is unavailable or failed).
+    async fn reregister(&self) -> Result<(), ()> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Reregister { reply })
+            .map_err(|_| ())?;
+        rx.await.map_err(|_| ())?
     }
 
     /// Dial `host:port` through the tunnel. Hostnames are resolved via 1.1.1.1 inside the
@@ -609,10 +681,53 @@ async fn drain_tx(device: &mut TunDevice, tunn: &mut Tunn, udp: &UdpSocket, scra
 }
 
 async fn driver(
-    cfg: WgConfig,
+    mut cfg: WgConfig,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     self_tx: mpsc::UnboundedSender<Cmd>,
+    reregister: Option<PathBuf>,
 ) -> Result<(), String> {
+    loop {
+        match run_session(&cfg, &mut cmd_rx, &self_tx).await? {
+            SessionEnd::Shutdown => return Ok(()),
+            SessionEnd::Reregister(reply) => {
+                // Only a WARP route can recover this way; a static WG route has no cache to renew.
+                let Some(path) = reregister.clone() else {
+                    let _ = reply.send(Err(()));
+                    continue;
+                };
+                // register_fresh does blocking HTTP, so run it off the async driver task. The next
+                // run_session() rebuilds every session-local resource from the new cfg.
+                match tokio::task::spawn_blocking(move || register_fresh(&path)).await {
+                    Ok(Ok(new_cfg)) => {
+                        tracing::info!(
+                            "WARP re-registered (previous device culled); reconnecting tunnel"
+                        );
+                        cfg = new_cfg;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("WARP re-registration failed: {e}");
+                        let _ = reply.send(Err(()));
+                    }
+                    Err(e) => {
+                        tracing::warn!("WARP re-registration task failed: {e}");
+                        let _ = reply.send(Err(()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Run one tunnel session with a fixed `cfg`: bind the UDP socket, drive the boringtun handshake
+/// + smoltcp interface, and service dial/read/write commands until the channel closes or a
+/// re-registration is requested. All per-session state (keys, socket, sessions) is local, so the
+/// outer `driver` loop gets a clean slate just by calling this again with a new `cfg`.
+async fn run_session(
+    cfg: &WgConfig,
+    cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    self_tx: &mpsc::UnboundedSender<Cmd>,
+) -> Result<SessionEnd, String> {
     let udp = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| format!("udp bind: {e}"))?;
@@ -680,7 +795,10 @@ async fn driver(
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    None => break,
+                    None => return Ok(SessionEnd::Shutdown),
+                    Some(Cmd::Reregister { reply }) => {
+                        return Ok(SessionEnd::Reregister(reply))
+                    }
                     Some(Cmd::Dial { ip, port, reply }) => {
                         let ip4 = match ip {
                             IpAddr::V4(v4) => v4,
@@ -720,8 +838,6 @@ async fn driver(
         pump_sockets(&mut sockets, &mut states);
         drain_tx(&mut device, &mut tunn, &udp, &mut scratch).await;
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

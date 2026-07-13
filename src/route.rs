@@ -249,13 +249,16 @@ fn build_route(spec: RouteSpec, name: &str) -> Result<Route, String> {
                     .parse()
                     .map_err(|_| format!("wireguard route {name:?}: bad address"))?,
             };
-            Ok(Route::Wireguard(WgTunnel::spawn(cfg)))
+            // Static WG has fixed user-provided keys — nothing to re-register.
+            Ok(Route::Wireguard(WgTunnel::spawn(cfg, None)))
         }
         RouteSpec::Warp { .. } => {
             let cache = std::path::PathBuf::from(format!("warp-{name}.json"));
             let cfg = crate::wireguard::register_warp(&cache)
                 .map_err(|e| format!("warp route {name:?}: {e}"))?;
-            Ok(Route::Wireguard(WgTunnel::spawn(cfg)))
+            // Pass the cache path so the tunnel can self-heal by re-registering if the WARP
+            // device gets culled (a stale registration whose endpoint stops answering).
+            Ok(Route::Wireguard(WgTunnel::spawn(cfg, Some(cache))))
         }
         RouteSpec::Tor { data_dir, .. } => {
             let dir = PathBuf::from(data_dir.unwrap_or_else(|| "arti-data".to_string()));
