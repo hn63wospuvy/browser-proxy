@@ -96,6 +96,15 @@ export default class HybridTransport {
     this.wisp = options.wisp ?? options.websocket;
     this.libcurl = new LibcurlClient(options);
 
+    // User-configured request-header overrides (from the page's editor, via setTransport options).
+    // Each {name, value} replaces any same-named header the browser set. Normalized defensively:
+    // keep only well-formed string pairs so a malformed option can't throw mid-request.
+    this.headerOverrides = Array.isArray(options.headerOverrides)
+      ? options.headerOverrides.filter(
+          (h) => h && typeof h.name === "string" && typeof h.value === "string" && h.name
+        )
+      : [];
+
     this.epoxyMod = null; // the imported epoxy module (for EpoxyHandlers in connect())
     // Two epoxy clients from the same module: "secure" still verifies certs (retries a libcurl
     // TLS-handshake failure, curl 35) and "insecure" disables verification (the consent fallback
@@ -193,17 +202,36 @@ export default class HybridTransport {
     return epoxyResponseToTransport(res);
   }
 
+  // Merge the configured overrides into a request's headers: drop any header whose name matches an
+  // override (case-insensitively, so we never send both `user-agent` and an overriding `User-Agent`)
+  // and append the override. With no overrides configured, the original headers pass through
+  // untouched — preserving the exact shape libcurl/epoxy already handle for the common case.
+  applyHeaderOverrides(headers) {
+    if (!this.headerOverrides.length) return headers;
+    const obj = toHeaderObject(headers);
+    const overridden = new Set(this.headerOverrides.map((h) => h.name.toLowerCase()));
+    const out = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (!overridden.has(key.toLowerCase())) out[key] = value;
+    }
+    for (const { name, value } of this.headerOverrides) out[name] = value;
+    return out;
+  }
+
   async request(remote, method, body, headers, signal) {
     const buffered = await bufferBody(body);
     const host = remote.host;
+    // Apply the user's header overrides once, up front, so every path (libcurl, and both epoxy
+    // retries) sends the same merged headers.
+    const merged = this.applyHeaderOverrides(headers);
 
     // Host already approved insecure → skip the doomed libcurl attempt and its wasted round-trip.
     if (this.allowedHosts.has(host)) {
-      return this.epoxyRequest(remote, method, buffered, headers, true);
+      return this.epoxyRequest(remote, method, buffered, merged, true);
     }
 
     try {
-      return await this.libcurl.request(remote, method, buffered, headers, signal);
+      return await this.libcurl.request(remote, method, buffered, merged, signal);
     } catch (err) {
       const code = curlErrorCode(err);
 
@@ -212,7 +240,7 @@ export default class HybridTransport {
       // epoxy's more capable TLS stack can complete a handshake mbedTLS couldn't.
       if (code === SSL_CONNECT_CODE) {
         console.warn(`[hybrid] libcurl TLS handshake failed for ${host} (code 35); retrying via epoxy (verified)`);
-        return this.epoxyRequest(remote, method, buffered, headers, false);
+        return this.epoxyRequest(remote, method, buffered, merged, false);
       }
 
       // A cert that failed verification: never auto-downgrade — ask the user first. Declined (or no
@@ -222,7 +250,7 @@ export default class HybridTransport {
       const allow = await this.askConsent(host);
       if (!allow) throw err;
       console.warn(`[hybrid] user approved insecure TLS for ${host}; retrying via epoxy`);
-      return this.epoxyRequest(remote, method, buffered, headers, true);
+      return this.epoxyRequest(remote, method, buffered, merged, true);
     }
   }
 
@@ -233,13 +261,16 @@ export default class HybridTransport {
     } catch {
       /* leave host empty → never treated as insecure */
     }
+    // Overrides apply to WebSocket upgrades too, so a custom User-Agent (etc.) is consistent across
+    // document and socket requests.
+    const merged = this.applyHeaderOverrides(requestHeaders);
     // libcurl's WebSocket surfaces no error code, so a wss:// can't self-detect a cert failure.
     // But a page loads its document over HTTP first; if the user approved that host's insecure
     // path, its sockets to that host follow onto epoxy here (no separate prompt).
     if (this.allowedHosts.has(host)) {
-      return this.epoxyConnect(url, protocols, requestHeaders, onopen, onmessage, onclose, onerror);
+      return this.epoxyConnect(url, protocols, merged, onopen, onmessage, onclose, onerror);
     }
-    return this.libcurl.connect(url, protocols, requestHeaders, onopen, onmessage, onclose, onerror);
+    return this.libcurl.connect(url, protocols, merged, onopen, onmessage, onclose, onerror);
   }
 
   epoxyConnect(url, protocols, requestHeaders, onopen, onmessage, onclose, onerror) {

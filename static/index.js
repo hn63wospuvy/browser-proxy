@@ -189,6 +189,431 @@ dnsInput.addEventListener("change", onDnsChange);
 
 loadDns();
 
+// --- Header overrides: user-entered name/value pairs injected into every proxied request ---
+//
+// Entirely client-side: the user manages the pairs in the editor modal, they persist in
+// localStorage, and `ensureTransport` hands them to the transport (static/hybrid/index.mjs), which
+// replaces any same-named browser header before dialing the target. (The Wisp server relays raw
+// TCP — and TLS is terminated in the browser — so header rewriting can only happen here.) Limits
+// are enforced on save: at most MAX_HEADERS entries, each value ≤ MAX_HEADER_VALUE_BYTES bytes.
+const HEADERS_KEY = "proxy-headers";
+const MAX_HEADERS = 100;
+const MAX_HEADER_VALUE_BYTES = 10240;
+// RFC 7230 header-name token: visible ASCII, no delimiters (keeps CR/LF/space/":" out of names).
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+// UTF-8 byte length (String.length counts UTF-16 units; the cap is measured in bytes).
+const byteLen = (s) => new TextEncoder().encode(s).length;
+
+// The live set of overrides (array of {name, value}), loaded from localStorage. Defensive against
+// hand-edited/corrupt storage: keep only well-formed string pairs, clamped to the limits.
+function loadStoredHeaders() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(HEADERS_KEY) || "[]");
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((h) => h && typeof h.name === "string" && typeof h.value === "string" && h.name)
+      .slice(0, MAX_HEADERS)
+      .map((h) => ({ name: h.name, value: h.value }));
+  } catch (_) {
+    return [];
+  }
+}
+let headerOverrides = loadStoredHeaders();
+
+const headersModal = document.getElementById("headers-modal");
+const headersRows = document.getElementById("headers-rows");
+const headersError = document.getElementById("headers-error");
+const headersCounter = document.getElementById("headers-counter");
+const headersAddBtn = document.getElementById("headers-add");
+const headersSaveBtn = document.getElementById("headers-save");
+const headersCancelBtn = document.getElementById("headers-cancel");
+const headersEditBtn = document.getElementById("headers-edit");
+const headersCountBadge = document.getElementById("headers-count");
+
+// "(N)" next to the Headers button when overrides are active; blank when there are none.
+function updateHeadersBadge() {
+  headersCountBadge.textContent = headerOverrides.length ? `(${headerOverrides.length})` : "";
+}
+
+// Row count / limit indicator, and disable "Add" once the cap is hit.
+function updateHeadersCounter() {
+  const n = headersRows.children.length;
+  headersCounter.textContent = `${n} / ${MAX_HEADERS}`;
+  headersAddBtn.disabled = n >= MAX_HEADERS;
+}
+
+// Build one editable row (name + value + remove). Live validation only tints the field; the
+// authoritative check runs on save (see collectHeaders).
+function makeHeaderRow(name = "", value = "") {
+  const row = document.createElement("div");
+  row.className = "headers-row";
+
+  const nameEl = document.createElement("input");
+  nameEl.className = "h-name";
+  nameEl.placeholder = "Tên (VD: User-Agent)";
+  nameEl.spellcheck = false;
+  nameEl.autocomplete = "off";
+  nameEl.value = name;
+  nameEl.addEventListener("input", () => {
+    const v = nameEl.value.trim();
+    nameEl.classList.toggle("invalid", v !== "" && !HEADER_NAME_RE.test(v));
+  });
+
+  const valueEl = document.createElement("input");
+  valueEl.className = "h-value";
+  valueEl.placeholder = "Giá trị";
+  valueEl.spellcheck = false;
+  valueEl.autocomplete = "off";
+  valueEl.value = value;
+  valueEl.addEventListener("input", () => {
+    valueEl.classList.toggle("invalid", byteLen(valueEl.value) > MAX_HEADER_VALUE_BYTES);
+  });
+
+  const rm = document.createElement("button");
+  rm.type = "button";
+  rm.className = "h-remove";
+  rm.title = "Xóa header";
+  rm.textContent = "✕";
+  rm.addEventListener("click", () => {
+    row.remove();
+    updateHeadersCounter();
+  });
+
+  row.append(nameEl, valueEl, rm);
+  return row;
+}
+
+function openHeadersEditor() {
+  closeSettings(); // don't leave the popover open behind the modal
+  headersError.hidden = true;
+  headersRows.replaceChildren();
+  for (const h of headerOverrides) headersRows.appendChild(makeHeaderRow(h.name, h.value));
+  if (!headerOverrides.length) headersRows.appendChild(makeHeaderRow()); // one empty row to start
+  updateHeadersCounter();
+  headersModal.hidden = false;
+}
+
+function closeHeadersEditor() {
+  headersModal.hidden = true;
+}
+
+// Read the rows back into a validated list, or return {error} for the first problem found. Fully
+// empty rows are skipped so a stray blank row never blocks saving.
+function collectHeaders() {
+  const out = [];
+  const seen = new Set();
+  for (const row of headersRows.querySelectorAll(".headers-row")) {
+    const name = row.querySelector(".h-name").value.trim();
+    const value = row.querySelector(".h-value").value;
+    if (!name && !value) continue;
+    if (!name) return { error: "Có dòng thiếu tên header." };
+    if (!HEADER_NAME_RE.test(name)) return { error: `Tên header không hợp lệ: "${name}".` };
+    if (/[\r\n\0]/.test(value)) return { error: `Giá trị của "${name}" chứa ký tự xuống dòng/điều khiển.` };
+    if (byteLen(value) > MAX_HEADER_VALUE_BYTES)
+      return { error: `Giá trị của "${name}" vượt quá ${MAX_HEADER_VALUE_BYTES} byte.` };
+    if (seen.has(name.toLowerCase())) return { error: `Header trùng tên: "${name}".` };
+    seen.add(name.toLowerCase());
+    out.push({ name, value });
+  }
+  if (out.length > MAX_HEADERS) return { error: `Tối đa ${MAX_HEADERS} header.` };
+  return { headers: out };
+}
+
+async function saveHeaders() {
+  const res = collectHeaders();
+  if (res.error) {
+    headersError.textContent = res.error;
+    headersError.hidden = false;
+    return;
+  }
+  headerOverrides = res.headers;
+  try {
+    localStorage.setItem(HEADERS_KEY, JSON.stringify(headerOverrides));
+  } catch (_) {
+    /* storage blocked/full: keep the in-memory copy for this session */
+  }
+  updateHeadersBadge();
+  closeHeadersEditor();
+  // Apply immediately while browsing: rebuild the transport (dropping the old WebSocket) and
+  // reload the current page so it re-fetches with the new headers.
+  if (frame && document.body.classList.contains("browsing")) {
+    try {
+      await ensureTransport();
+      if (frame.__lastTarget) {
+        showLoading(frame.__lastTarget);
+        frame.go(frame.__lastTarget);
+      }
+    } catch (err) {
+      console.error("header override apply failed", err);
+    }
+  }
+}
+
+headersEditBtn.addEventListener("click", openHeadersEditor);
+headersCancelBtn.addEventListener("click", closeHeadersEditor);
+headersSaveBtn.addEventListener("click", saveHeaders);
+headersAddBtn.addEventListener("click", () => {
+  if (headersRows.children.length >= MAX_HEADERS) return;
+  headersRows.appendChild(makeHeaderRow());
+  updateHeadersCounter();
+  headersRows.lastElementChild.querySelector(".h-name").focus();
+});
+updateHeadersBadge();
+
+// --- Configuration profiles: named snapshots of the whole config, stored in localStorage ---
+//
+// A profile bundles the user's settings — Route, DNS, Search engine, and the header overrides —
+// under a name. Saving captures the current config; applying restores all of it at once (and, while
+// browsing, rebuilds the transport + reloads). Everything lives client-side in localStorage.
+const PROFILES_KEY = "proxy-profiles";
+const MAX_PROFILES = 50;
+const MAX_PROFILE_NAME = 64;
+
+// Load + sanitize the saved profiles (defensive against hand-edited/corrupt storage): keep only
+// well-formed entries, and normalize each field so a missing/garbage value can't break apply.
+function loadProfiles() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(PROFILES_KEY) || "[]");
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((p) => p && typeof p.name === "string" && p.name)
+      .slice(0, MAX_PROFILES)
+      .map((p) => ({
+        name: p.name,
+        route: typeof p.route === "string" ? p.route : "direct",
+        engine: typeof p.engine === "string" ? p.engine : DEFAULT_ENGINE,
+        dns: typeof p.dns === "string" ? p.dns : "",
+        headers: Array.isArray(p.headers)
+          ? p.headers
+              .filter((h) => h && typeof h.name === "string" && typeof h.value === "string" && h.name)
+              .slice(0, MAX_HEADERS)
+              .map((h) => ({ name: h.name, value: h.value }))
+          : [],
+      }));
+  } catch (_) {
+    return [];
+  }
+}
+let profiles = loadProfiles();
+
+const PROFILE_ACTIVE_KEY = "proxy-active-profile";
+const profileSelect = document.getElementById("proxy-profile");
+const profileNewBtn = document.getElementById("profile-new");
+const profileUpdateBtn = document.getElementById("profile-update");
+const profileDeleteBtn = document.getElementById("profile-delete");
+const profileClearBtn = document.getElementById("profile-clear");
+// "Tạo mới" name modal.
+const profileNameModal = document.getElementById("profile-name-modal");
+const profileNameInput = document.getElementById("profile-name-input");
+const profileNameSaveBtn = document.getElementById("profile-name-save");
+const profileNameCancelBtn = document.getElementById("profile-name-cancel");
+const profileNameError = document.getElementById("profile-name-error");
+
+// Transient UI state: the two-step "Xóa hết" confirm and the "Cập nhật" success flash.
+let clearArmed = false;
+let clearTimer = null;
+let updateFeedbackTimer = null;
+
+function saveProfiles() {
+  try {
+    localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+  } catch (_) {
+    /* storage blocked/full: keep the in-memory copy for this session */
+  }
+}
+
+// The current live settings, as a profile-shaped object.
+function currentConfig() {
+  return {
+    route: currentRoute(),
+    engine: currentEngine(),
+    dns: (dnsInput.value || "").trim(),
+    headers: headerOverrides.map((h) => ({ name: h.name, value: h.value })),
+  };
+}
+
+// Restore a profile's settings into the live controls, then rebuild the transport + reload once
+// (if browsing) so a single apply doesn't reload per setting. Fields are applied defensively: a
+// saved route/engine that no longer exists is skipped rather than blanking the control.
+async function applyProfile(p) {
+  if (!routePicker.hidden && [...routeSelect.options].some((o) => o.value === p.route)) {
+    routeSelect.value = p.route;
+    localStorage.setItem(ROUTE_KEY, p.route);
+  }
+  if (SEARCH_ENGINES.some((e) => e.id === p.engine)) {
+    engineSelect.value = p.engine;
+    localStorage.setItem(ENGINE_KEY, p.engine);
+  }
+  dnsInput.value = p.dns || "";
+  localStorage.setItem(DNS_KEY, p.dns || "");
+  dnsInput.classList.toggle("invalid", !dnsIsValid((p.dns || "").trim()));
+
+  headerOverrides = (p.headers || []).map((h) => ({ name: h.name, value: h.value }));
+  try {
+    localStorage.setItem(HEADERS_KEY, JSON.stringify(headerOverrides));
+  } catch (_) {
+    /* keep in-memory */
+  }
+  updateHeadersBadge();
+
+  if (frame && document.body.classList.contains("browsing")) {
+    try {
+      await ensureTransport();
+      if (frame.__lastTarget) {
+        showLoading(frame.__lastTarget);
+        frame.go(frame.__lastTarget);
+      }
+    } catch (err) {
+      console.error("profile apply failed", err);
+    }
+  }
+}
+
+// Rebuild the dropdown from `profiles`, keeping `selected` if it still exists; a leading
+// placeholder means "no profile selected". Also refreshes the action buttons' enabled state.
+function renderProfileSelect(selected = profileSelect.value) {
+  profileSelect.replaceChildren();
+  const ph = document.createElement("option");
+  ph.value = "";
+  ph.textContent = profiles.length ? "— Chọn hồ sơ —" : "— Chưa có hồ sơ —";
+  profileSelect.appendChild(ph);
+  for (const p of profiles) {
+    const o = document.createElement("option");
+    o.value = p.name;
+    o.textContent = p.name;
+    profileSelect.appendChild(o);
+  }
+  profileSelect.value = profiles.some((p) => p.name === selected) ? selected : "";
+  updateProfileButtons();
+}
+
+// Cập nhật / Xóa act on the selected profile; "Xóa hết" needs at least one profile to exist.
+function updateProfileButtons() {
+  profileUpdateBtn.disabled = !profileSelect.value;
+  profileDeleteBtn.disabled = !profileSelect.value;
+  profileClearBtn.disabled = !profiles.length;
+  disarmClear(); // a render/selection change cancels any pending "Xóa hết" confirm
+}
+
+// Persist which profile is active so the dropdown restores its selection on reload.
+function setActiveProfile(name) {
+  try {
+    localStorage.setItem(PROFILE_ACTIVE_KEY, name || "");
+  } catch (_) {
+    /* ignore */
+  }
+  profileSelect.value = name || "";
+  updateProfileButtons();
+}
+
+// Picking a profile from the dropdown applies it and marks it active; the placeholder clears it.
+profileSelect.addEventListener("change", () => {
+  const name = profileSelect.value;
+  if (!name) {
+    setActiveProfile("");
+    return;
+  }
+  const p = profiles.find((x) => x.name === name);
+  if (p) {
+    setActiveProfile(name);
+    applyProfile(p);
+  } else {
+    updateProfileButtons();
+  }
+});
+
+// --- Tạo mới: enter a name in a small modal, then save the current config as a new profile ---
+function showNameError(msg) {
+  profileNameError.textContent = msg || "";
+  profileNameError.hidden = !msg;
+}
+function openNameModal() {
+  closeSettings(); // don't leave the popover open behind the modal
+  showNameError("");
+  profileNameInput.value = "";
+  profileNameModal.hidden = false;
+  profileNameInput.focus();
+}
+function closeNameModal() {
+  profileNameModal.hidden = true;
+}
+function createProfile() {
+  const name = (profileNameInput.value || "").trim();
+  if (!name) return showNameError("Nhập tên hồ sơ.");
+  if (name.length > MAX_PROFILE_NAME) return showNameError(`Tên tối đa ${MAX_PROFILE_NAME} ký tự.`);
+  if (profiles.some((p) => p.name.toLowerCase() === name.toLowerCase()))
+    return showNameError("Tên hồ sơ đã tồn tại.");
+  if (profiles.length >= MAX_PROFILES) return showNameError(`Tối đa ${MAX_PROFILES} hồ sơ.`);
+  profiles.push({ name, ...currentConfig() });
+  saveProfiles();
+  closeNameModal();
+  renderProfileSelect(name);
+  setActiveProfile(name);
+}
+
+// --- Cập nhật: overwrite the selected profile with the current config ---
+function updateSelectedProfile() {
+  const name = profileSelect.value;
+  const at = profiles.findIndex((p) => p.name === name);
+  if (at < 0) return;
+  profiles[at] = { name, ...currentConfig() };
+  saveProfiles();
+  profileUpdateBtn.textContent = "Đã lưu ✓"; // brief inline confirmation
+  clearTimeout(updateFeedbackTimer);
+  updateFeedbackTimer = setTimeout(() => (profileUpdateBtn.textContent = "Cập nhật"), 1500);
+}
+
+// --- Xóa: remove the selected profile ---
+function deleteSelectedProfile() {
+  const name = profileSelect.value;
+  if (!name) return;
+  profiles = profiles.filter((p) => p.name !== name);
+  saveProfiles();
+  setActiveProfile("");
+  renderProfileSelect("");
+}
+
+// --- Xóa hết: two-step confirm on the button itself (no native dialog) ---
+function disarmClear() {
+  if (!clearArmed) return;
+  clearArmed = false;
+  clearTimeout(clearTimer);
+  profileClearBtn.textContent = "Xóa hết";
+  profileClearBtn.classList.remove("armed");
+}
+function onClearClick() {
+  if (!profiles.length) return;
+  if (!clearArmed) {
+    clearArmed = true;
+    profileClearBtn.textContent = "Chắc chắn?";
+    profileClearBtn.classList.add("armed");
+    clearTimer = setTimeout(disarmClear, 3000);
+    return;
+  }
+  disarmClear();
+  profiles = [];
+  saveProfiles();
+  setActiveProfile("");
+  renderProfileSelect("");
+}
+
+profileNewBtn.addEventListener("click", openNameModal);
+profileUpdateBtn.addEventListener("click", updateSelectedProfile);
+profileDeleteBtn.addEventListener("click", deleteSelectedProfile);
+profileClearBtn.addEventListener("click", onClearClick);
+profileNameSaveBtn.addEventListener("click", createProfile);
+profileNameCancelBtn.addEventListener("click", closeNameModal);
+profileNameInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    createProfile();
+  }
+});
+
+// Initial render, restoring the previously-active selection (without re-applying — the individual
+// settings are already persisted, so the live config already matches).
+renderProfileSelect(localStorage.getItem(PROFILE_ACTIVE_KEY) || "");
+
 // Wire the autocomplete dropdown now that the input/form/container all exist.
 autocomplete = initAutocomplete({ input: address, form, container: acContainer });
 
@@ -361,6 +786,12 @@ function showConfigFlash() {
     flashRow("Search", engineLabel(currentEngine())),
     flashRow("DNS", dns),
   ];
+  if (headerOverrides.length) {
+    rows.push(flashRow("Headers", `${headerOverrides.length} ghi đè`));
+  }
+  if (profileSelect && profileSelect.value) {
+    rows.push(flashRow("Profile", profileSelect.value));
+  }
   // Surface the insecure-TLS state too, when the current site is on the unverified path.
   const host = currentTargetHost();
   if (host && insecureHosts.has(host)) {
@@ -499,6 +930,18 @@ function onHotkey(e) {
     answerConsent(false);
     return;
   }
+  // An open header editor closes on Esc (discarding unsaved edits) before anything else.
+  if (headersModal && !headersModal.hidden) {
+    e.preventDefault();
+    closeHeadersEditor();
+    return;
+  }
+  // Likewise the "Tạo mới" profile name modal.
+  if (profileNameModal && !profileNameModal.hidden) {
+    e.preventDefault();
+    closeNameModal();
+    return;
+  }
   // Precedence: an open autocomplete dropdown swallows Esc (just close it)...
   if (autocomplete && autocomplete.isOpen()) {
     e.preventDefault();
@@ -571,11 +1014,21 @@ function wispUrl() {
  */
 const TRANSPORT = "/hybrid/index.mjs";
 let activeWispUrl = null;
+let activeHeadersKey = null;
 async function ensureTransport() {
   const url = wispUrl();
-  if ((await connection.getTransport()) !== TRANSPORT || activeWispUrl !== url) {
-    await connection.setTransport(TRANSPORT, [{ websocket: url }]);
+  // Header overrides ride along in the transport options. A change to them (like a route/DNS
+  // change) must rebuild the transport, so fold them into the cache key — otherwise a same-URL
+  // save would keep the stale transport and never apply the new headers.
+  const headersKey = JSON.stringify(headerOverrides);
+  if (
+    (await connection.getTransport()) !== TRANSPORT ||
+    activeWispUrl !== url ||
+    activeHeadersKey !== headersKey
+  ) {
+    await connection.setTransport(TRANSPORT, [{ websocket: url, headerOverrides }]);
     activeWispUrl = url;
+    activeHeadersKey = headersKey;
   }
 }
 

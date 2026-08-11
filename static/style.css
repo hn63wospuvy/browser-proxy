@@ -73,22 +73,34 @@ input:focus {
   border-color: var(--accent);
 }
 
-/* Prominent pickers on the landing page (before browsing). */
+/* Pickers stack vertically — one row per setting, label on the left, control on the right. */
 .pickers {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: center;
-  gap: 0.75rem 1.25rem;
+  flex-direction: column;
+  gap: 0.7rem;
   margin-top: 1.25rem;
 }
 
-.pickers label {
-  display: inline-flex;
+/* On the landing, keep the column a tidy centered width (the popover sets its own). */
+#landing .pickers {
+  width: 100%;
+  max-width: 480px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.pickers label,
+.pickers .picker-row {
+  display: flex;
   align-items: center;
-  gap: 0.5rem;
+  justify-content: space-between;
+  gap: 0.75rem;
   font-size: 1rem;
   color: var(--muted, #9aa4b2);
+}
+
+.pickers .picker-label {
+  flex: 0 0 auto;
 }
 
 /* The explicit display above would otherwise defeat the `hidden` attribute — restore it so a
@@ -123,6 +135,31 @@ input:focus {
 /* A typed value that's neither a known preset nor a valid IP. */
 .pickers input.invalid {
   border-color: var(--error);
+}
+
+/* The Headers picker is a button that opens the editor modal; style it like the field controls
+   (overriding the accent-colored base `button`) so it sits flush with the selects/inputs. */
+.pickers .picker-btn {
+  padding: 0.5rem 0.75rem;
+  font-size: 1rem;
+  font-weight: 500;
+  color: var(--fg);
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.pickers .picker-btn:hover {
+  border-color: var(--accent);
+  filter: none;
+}
+
+/* Count of active overrides, e.g. "(3)", shown next to the Headers button label. */
+.headers-count {
+  margin-left: 0.3rem;
+  color: var(--accent);
+  font-weight: 600;
 }
 
 /* Input + autocomplete dropdown share this positioning context; it flexes like the old input. */
@@ -181,12 +218,13 @@ input:focus {
   border-color: var(--accent);
 }
 
-/* Popover holding the reparented Route/DNS/Search controls while browsing. */
+/* Popover holding the reparented Route/DNS/Search/Headers/Profile controls while browsing. */
 #settings-popover {
   position: absolute;
   top: calc(100% + 6px);
   right: 0.75rem;
   z-index: 40;
+  max-width: min(92vw, 440px);
   padding: 0.75rem 1rem;
   background: #12151cf7;
   border: 1px solid var(--border);
@@ -195,16 +233,10 @@ input:focus {
   backdrop-filter: blur(6px);
 }
 
-/* Inside the popover the pickers stack vertically (label left, control right). */
+/* The pickers are already a vertical column; inside the popover just tighten the spacing. */
 #settings-popover .pickers {
-  flex-direction: column;
-  align-items: stretch;
   gap: 0.6rem;
   margin-top: 0;
-}
-
-#settings-popover .pickers label {
-  justify-content: space-between;
 }
 
 button {
@@ -519,6 +551,199 @@ body.browsing #frame-host {
 
 .btn-danger {
   background: var(--error);
+}
+
+/* --- Header-override editor modal --- */
+
+.headers-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: #0009;
+  backdrop-filter: blur(3px);
+}
+
+.headers-modal[hidden] {
+  display: none;
+}
+
+.headers-dialog {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 560px;
+  max-height: 85vh;
+  padding: 1.25rem 1.4rem;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px #000b;
+}
+
+.headers-dialog h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+}
+
+.headers-sub {
+  margin: 0 0 0.9rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+/* The scrollable list of header rows (grows with content, capped by the dialog's max-height). */
+.headers-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  padding-right: 0.2rem;
+}
+
+.headers-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.headers-row input {
+  min-width: 0;
+  padding: 0.45rem 0.6rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.headers-row .h-name {
+  flex: 0 0 38%;
+}
+
+.headers-row .h-value {
+  flex: 1;
+}
+
+.headers-row input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.headers-row input.invalid {
+  border-color: var(--error);
+}
+
+/* ✕ remove-row button: a quiet bordered square, not the accent primary. */
+.headers-row .h-remove {
+  flex: 0 0 auto;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  font-weight: 400;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.headers-row .h-remove:hover {
+  color: var(--error);
+  border-color: var(--error);
+  filter: none;
+}
+
+.headers-error {
+  margin: 0.7rem 0 0;
+  color: var(--error);
+  font-size: 0.85rem;
+}
+
+.headers-error[hidden] {
+  display: none;
+}
+
+.headers-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0.8rem;
+}
+
+.headers-counter {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.headers-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: none;
+}
+
+/* --- Profiles: dropdown + inline action buttons, plus the "Tạo mới" name modal --- */
+
+/* The Profile row's control cluster (dropdown + Tạo mới / Cập nhật / Xóa / Xóa hết). Wraps
+   gracefully when the row is narrow. */
+.profile-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+
+.profile-btn {
+  padding: 0.45rem 0.6rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--fg);
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.profile-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  filter: none;
+}
+
+.profile-btn.danger:hover:not(:disabled) {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+/* "Xóa hết" armed for its second (confirming) click. */
+.profile-btn.armed {
+  color: var(--error);
+  border-color: var(--error);
+  background: #2a1512;
+}
+
+/* Name input inside the "Tạo mới" modal. */
+.profile-name-input {
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.95rem;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.profile-name-input:focus {
+  border-color: var(--accent);
+  outline: none;
 }
 
 /* Dim config panel flashed on Esc (center of the viewport), fading out over ~1s. */

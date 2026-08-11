@@ -76,6 +76,27 @@
           Route:
           <select id="proxy-route-landing" aria-label="Route"></select>
         </label>
+        <label id="headers-picker">
+          Headers:
+          <button
+            id="headers-edit"
+            type="button"
+            class="picker-btn"
+            aria-label="Chỉnh sửa header ghi đè"
+          >
+            Chỉnh sửa<span id="headers-count" class="headers-count"></span>
+          </button>
+        </label>
+        <div id="profiles-picker" class="picker-row">
+          <span class="picker-label">Profile:</span>
+          <span class="profile-controls">
+            <select id="proxy-profile" aria-label="Chọn hồ sơ cấu hình"></select>
+            <button id="profile-new" type="button" class="profile-btn">Tạo mới</button>
+            <button id="profile-update" type="button" class="profile-btn">Cập nhật</button>
+            <button id="profile-delete" type="button" class="profile-btn danger">Xóa</button>
+            <button id="profile-clear" type="button" class="profile-btn danger">Xóa hết</button>
+          </span>
+        </div>
       </div>
       <p id="proxy-error" class="error"></p>
       <pre id="proxy-error-code" class="error-code"></pre>
@@ -111,6 +132,63 @@
       title="Kết nối tới trang này KHÔNG xác thực chứng chỉ TLS (có thể bị nghe lén)"
     >
       🔓 Insecure TLS
+    </div>
+
+    <!-- Header-override editor: user-entered name/value pairs the transport injects into every
+         proxied request (overriding same-named browser headers). Stored client-side (localStorage);
+         capped at 100 headers, each value ≤ 10240 bytes. Rows are built dynamically by index.js. -->
+    <div id="headers-modal" class="headers-modal" hidden>
+      <div
+        class="headers-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="headers-title"
+      >
+        <h2 id="headers-title">Ghi đè header</h2>
+        <p class="headers-sub">
+          Các header dưới đây được thêm hoặc ghi đè vào mọi yêu cầu qua proxy. Tối đa 100 header,
+          mỗi giá trị không quá 10240 byte.
+        </p>
+        <div id="headers-rows" class="headers-rows"></div>
+        <p id="headers-error" class="headers-error" hidden></p>
+        <div class="headers-foot">
+          <button type="button" id="headers-add" class="btn-secondary">+ Thêm header</button>
+          <span id="headers-counter" class="headers-counter"></span>
+        </div>
+        <div class="headers-actions">
+          <button type="button" id="headers-cancel" class="btn-secondary">Hủy</button>
+          <button type="button" id="headers-save">Lưu</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- "Tạo mới" profile: a small name prompt. Saving snapshots the whole current config
+         (Route + DNS + Search + header overrides) into a named profile in localStorage. -->
+    <div id="profile-name-modal" class="headers-modal" hidden>
+      <div
+        class="headers-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="profile-name-title"
+      >
+        <h2 id="profile-name-title">Tạo hồ sơ mới</h2>
+        <p class="headers-sub">
+          Lưu toàn bộ cấu hình hiện tại (Route, DNS, Search và các header ghi đè) thành một hồ sơ.
+        </p>
+        <input
+          id="profile-name-input"
+          class="profile-name-input"
+          placeholder="Tên hồ sơ…"
+          maxlength="64"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <p id="profile-name-error" class="headers-error" hidden></p>
+        <div class="headers-actions">
+          <button type="button" id="profile-name-cancel" class="btn-secondary">Hủy</button>
+          <button type="button" id="profile-name-save">Lưu</button>
+        </div>
+      </div>
     </div>
 
     <!-- Per-host consent dialog: shown when a site's TLS certificate fails verification. The
