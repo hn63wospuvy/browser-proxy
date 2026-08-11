@@ -31,6 +31,12 @@ routes:
   # Cloudflare WARP, registered in-process (one binary, no warp-cli):
   - name: warp
     type: warp
+    # Independent tunnels to spread load across, dialed round-robin (default 1, max 16). Each
+    # one is its own registered device — own keys, own exit address, own driver task (a tunnel
+    # driver is single-threaded) and own 16k source-port space. Raise it when several people
+    # share the proxy; each extra tunnel registers once on first start and is then cached in
+    # warp-<name>-<n>.json.
+    # tunnels: 4
 
   # A generic WireGuard peer you configure yourself (e.g. wgcf-generated):
   # - name: myvpn

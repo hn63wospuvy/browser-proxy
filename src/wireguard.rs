@@ -7,10 +7,11 @@
 //! of it — no locks — and shuttles packets between boringtun and smoltcp, servicing dial /
 //! read / write commands from `WgStream` handles.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -22,7 +23,7 @@ use serde::Deserialize;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmolInstant;
+use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UdpSocket;
@@ -34,6 +35,28 @@ use crate::wisp::R_UNREACHABLE;
 const WG_MTU: usize = 1280;
 /// smoltcp per-socket buffer size.
 const SOCK_BUF: usize = 64 * 1024;
+/// Dynamic (ephemeral) source-port range for tunnel sockets.
+const PORT_LO: u16 = 49152;
+const PORT_HI: u16 = 65535;
+/// Max bytes buffered for one stream between the tunnel and its reader. While this much is
+/// outstanding the driver stops draining smoltcp, so the receive window closes and the peer
+/// stops sending — bounded memory instead of a slow reader buffering a whole download in RAM.
+const RECV_HIGH_WATER: usize = SOCK_BUF;
+/// How long a socket asked to close may sit unfinished before it is aborted. A peer that never
+/// answers the FIN would otherwise pin the socket — and its source port — for the process's life.
+const CLOSE_GRACE: u64 = 10;
+/// Max bytes a stream may have queued toward the tunnel before its writer has to wait. Without
+/// this the Wisp layer credits the client back the instant a write is *queued*, so a client
+/// uploading faster than the tunnel drains would grow `pending_write` without bound.
+const SEND_HIGH_WATER: usize = SOCK_BUF;
+/// Consecutive dials that die without the tunnel delivering a single packet before the session
+/// is presumed dead. Inbound traffic of any kind (including a refusal) resets the streak, so a
+/// run of genuinely unreachable targets cannot be mistaken for a dead tunnel.
+const DEAD_AFTER_FAILED_DIALS: u32 = 3;
+/// Minimum gap between WARP re-registrations. Cloudflare throttles bursts from one IP, and a
+/// throttled device fails to handshake exactly like the fault that prompted the re-registration
+/// — so an ungated retry loop turns a blip into a permanent outage.
+const REREGISTER_COOLDOWN: Duration = Duration::from_secs(60);
 
 // ===================== WARP registration =====================
 
@@ -261,9 +284,10 @@ pub fn dns_query(host: &str) -> Vec<u8> {
     q
 }
 
-/// Extract the first A record from a DNS response, skipping the question section and any
-/// non-A answers (CNAME, etc.). Handles compressed names by length-skipping.
-pub fn dns_first_a(resp: &[u8]) -> Option<Ipv4Addr> {
+/// Extract the first A record from a DNS response as `(address, ttl_seconds)`, skipping the
+/// question section and any non-A answers (CNAME, etc.). Handles compressed names by
+/// length-skipping. The TTL drives how long the tunnel's [`DnsCache`] may serve the answer.
+pub fn dns_first_a(resp: &[u8]) -> Option<(Ipv4Addr, u32)> {
     if resp.len() < 12 {
         return None;
     }
@@ -282,13 +306,16 @@ pub fn dns_first_a(resp: &[u8]) -> Option<Ipv4Addr> {
             return None;
         }
         let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+        // TYPE(2) CLASS(2) TTL(4) RDLENGTH(2), then the record data.
+        let ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
         let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
         pos += 10;
         if pos + rdlen > resp.len() {
             return None;
         }
         if rtype == 1 && rdlen == 4 {
-            return Some(Ipv4Addr::new(resp[pos], resp[pos + 1], resp[pos + 2], resp[pos + 3]));
+            let ip = Ipv4Addr::new(resp[pos], resp[pos + 1], resp[pos + 2], resp[pos + 3]);
+            return Some((ip, ttl));
         }
         pos += rdlen;
     }
@@ -310,6 +337,265 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
+// ===================== DNS cache =====================
+
+/// Hostnames the tunnel's DNS cache holds. Every miss costs a TCP connection through the tunnel
+/// (and a source port), so with many users a cache is the difference between one lookup per host
+/// and one per request — but it must stay bounded or it becomes its own memory leak.
+const DNS_CACHE_MAX: usize = 512;
+/// TTL floor: authoritative answers with a very short TTL would otherwise defeat the cache.
+const DNS_TTL_MIN: u64 = 30;
+/// TTL ceiling: keeps a stale answer from pinning a dead IP for hours.
+const DNS_TTL_MAX: u64 = 3600;
+
+/// Bounded hostname -> address cache for lookups made through the tunnel. `now` is passed in
+/// rather than read from the clock so expiry is exercised directly by tests.
+struct DnsCache {
+    entries: HashMap<String, (Ipv4Addr, std::time::Instant)>,
+}
+
+impl DnsCache {
+    fn new() -> Self {
+        DnsCache {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// The cached address for `host`, if it has not expired.
+    fn get(&self, host: &str, now: std::time::Instant) -> Option<Ipv4Addr> {
+        match self.entries.get(host) {
+            Some((ip, expires)) if *expires > now => Some(*ip),
+            _ => None,
+        }
+    }
+
+    /// Cache `ip` for `host`, clamping `ttl_secs` into [`DNS_TTL_MIN`, `DNS_TTL_MAX`] and
+    /// evicting as needed to stay within [`DNS_CACHE_MAX`].
+    fn insert(&mut self, host: &str, ip: Ipv4Addr, ttl_secs: u32, now: std::time::Instant) {
+        if self.entries.len() >= DNS_CACHE_MAX && !self.entries.contains_key(host) {
+            self.entries.retain(|_, (_, expires)| *expires > now);
+            // Everything is still live: drop one arbitrary entry to make room. Which one barely
+            // matters — a wrong guess costs one lookup, and the cap is what must hold.
+            while self.entries.len() >= DNS_CACHE_MAX {
+                let victim = match self.entries.keys().next() {
+                    Some(k) => k.clone(),
+                    None => break,
+                };
+                self.entries.remove(&victim);
+            }
+        }
+        let ttl = (ttl_secs as u64).clamp(DNS_TTL_MIN, DNS_TTL_MAX);
+        self.entries
+            .insert(host.to_string(), (ip, now + Duration::from_secs(ttl)));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+// ===================== Backpressure toward the tunnel =====================
+
+/// Bytes a stream has queued toward the tunnel but that the driver has not yet pushed into the
+/// socket. Shared by both sides: the writer parks when it hits [`SEND_HIGH_WATER`] and the
+/// driver wakes it as it drains.
+#[derive(Clone)]
+struct SendWindow(Arc<SendWindowInner>);
+
+struct SendWindowInner {
+    queued: AtomicUsize,
+    /// Set when the socket is gone, so a parked writer is released instead of hanging.
+    closed: AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl SendWindow {
+    fn new() -> Self {
+        SendWindow(Arc::new(SendWindowInner {
+            queued: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            waker: std::sync::Mutex::new(None),
+        }))
+    }
+
+    /// Ready once the writer may queue more bytes — or the socket died, which the caller
+    /// distinguishes with [`SendWindow::is_closed`].
+    fn poll_reserve(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.ready() {
+            return Poll::Ready(());
+        }
+        self.park(cx.waker());
+        // Re-check after parking: the driver may have drained between the check above and the
+        // waker being visible to it, and it only wakes a waker it can see.
+        if self.ready() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+
+    fn ready(&self) -> bool {
+        self.is_closed() || self.0.queued.load(Ordering::Acquire) < SEND_HIGH_WATER
+    }
+
+    fn park(&self, waker: &std::task::Waker) {
+        let mut slot = self.lock_waker();
+        *slot = Some(waker.clone());
+    }
+
+    /// Take the parked waker, if any, and wake it. One-shot: a writer re-parks on its next poll.
+    fn wake(&self) {
+        let taken = self.lock_waker().take();
+        if let Some(w) = taken {
+            w.wake();
+        }
+    }
+
+    fn lock_waker(&self) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
+        self.0
+            .waker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The writer queued `n` bytes.
+    fn queued(&self, n: usize) {
+        self.0.queued.fetch_add(n, Ordering::AcqRel);
+    }
+
+    /// The driver pushed `n` bytes into the socket, freeing that much of the window.
+    fn drained(&self, n: usize) {
+        let before = self.0.queued.fetch_sub(n, Ordering::AcqRel);
+        if before >= SEND_HIGH_WATER && before - n < SEND_HIGH_WATER {
+            self.wake();
+        }
+    }
+
+    /// The socket is gone: release any parked writer.
+    fn close(&self) {
+        self.0.closed.store(true, Ordering::Release);
+        self.wake();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
+    }
+}
+
+/// The driver's half of a [`SendWindow`]. Closing on drop makes the release structural: a writer
+/// parked on a socket the driver has lost — reaped, or dropped wholesale when a session is
+/// rebuilt — is woken without every teardown path having to remember to do it.
+struct SendGuard(SendWindow);
+
+impl SendGuard {
+    fn new(window: SendWindow) -> Self {
+        SendGuard(window)
+    }
+
+    fn window(&self) -> &SendWindow {
+        &self.0
+    }
+}
+
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+// ===================== Session health & re-registration =====================
+
+/// Which tunnel session a stream belongs to. A re-registration gives the tunnel new keys and a
+/// new source address, so connections opened before it cannot survive — they must report a
+/// reset rather than a clean EOF, which would tell the client the peer had closed normally.
+#[derive(Clone)]
+struct SessionMark {
+    current: Arc<AtomicU64>,
+    mine: u64,
+}
+
+impl SessionMark {
+    fn is_stale(&self) -> bool {
+        self.current.load(Ordering::Acquire) != self.mine
+    }
+}
+
+/// Decides when a tunnel session looks dead. Dials that die *while the tunnel is silent* are the
+/// signal: an idle-but-healthy tunnel is silent too, so silence alone would be a false alarm,
+/// and a refused connection arrives as an inbound packet, which clears the streak.
+struct SessionHealth {
+    failed_dials: u32,
+}
+
+impl SessionHealth {
+    fn new() -> Self {
+        SessionHealth { failed_dials: 0 }
+    }
+
+    /// A socket was reaped without ever establishing. True once the streak says "re-register".
+    fn dial_failed(&mut self) -> bool {
+        self.failed_dials += 1;
+        self.failed_dials >= DEAD_AFTER_FAILED_DIALS
+    }
+
+    /// The tunnel delivered something (a packet arrived, or a socket established).
+    fn alive(&mut self) {
+        self.failed_dials = 0;
+    }
+}
+
+/// Rate-limits re-registration; see [`REREGISTER_COOLDOWN`].
+struct ReregisterGate {
+    last: Option<std::time::Instant>,
+}
+
+impl ReregisterGate {
+    fn new() -> Self {
+        ReregisterGate { last: None }
+    }
+
+    /// Whether a re-registration may start now, recording it when it may.
+    fn allow(&mut self, now: std::time::Instant) -> bool {
+        if let Some(last) = self.last {
+            if now.duration_since(last) < REREGISTER_COOLDOWN {
+                return false;
+            }
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
+// ===================== Tunnel pool =====================
+
+/// Next slot in a round-robin over `len` items.
+fn rr_index(counter: &AtomicUsize, len: usize) -> usize {
+    counter.fetch_add(1, Ordering::Relaxed) % len.max(1)
+}
+
+/// A set of independent tunnels for one route, dialed round-robin. Each tunnel is a separate
+/// WARP device with its own keys, exit address, driver task and source-port space, so adding
+/// tunnels adds both throughput (the driver is single-threaded) and port headroom.
+pub struct WgPool {
+    tunnels: Vec<Arc<WgTunnel>>,
+    next: AtomicUsize,
+}
+
+impl WgPool {
+    pub fn new(tunnels: Vec<Arc<WgTunnel>>) -> Self {
+        WgPool {
+            tunnels,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Dial through the next tunnel in the rotation.
+    pub async fn dial(&self, host: &str, port: u16, timeout: Duration) -> Result<WgStream, u8> {
+        let i = rr_index(&self.next, self.tunnels.len());
+        self.tunnels[i].dial(host, port, timeout).await
+    }
+}
+
 // ===================== Tunnel driver =====================
 
 /// Command from a `WgStream` / dialer to the driver task.
@@ -326,6 +612,10 @@ enum Cmd {
     Close {
         handle: SocketHandle,
     },
+    /// A reader drained enough of its backlog to reopen its `RecvWindow`. Carries nothing: the
+    /// driver pumps every socket after each command, so arriving is the whole point — it just
+    /// saves waiting up to one tick before smoltcp gets drained again.
+    Resume,
     /// Re-register WARP fresh and rebuild the tunnel session with new keys/endpoint. Replies
     /// `Ok` once the new session is starting, `Err` if re-registration isn't possible or failed.
     Reregister {
@@ -337,8 +627,10 @@ enum Cmd {
 enum SessionEnd {
     /// The command channel closed (all `WgStream`s + the tunnel dropped) — stop the driver.
     Shutdown,
-    /// A `Reregister` command arrived; the outer loop re-registers and starts a new session.
-    Reregister(oneshot::Sender<Result<(), ()>>),
+    /// A re-registration is due — either a `Reregister` command (which carries a reply) or the
+    /// session itself concluding the tunnel is dead. The outer loop re-registers and starts a
+    /// new session.
+    Reregister(Option<oneshot::Sender<Result<(), ()>>>),
 }
 
 /// Shared handle to a WireGuard tunnel. Cheap to clone (just the command sender).
@@ -346,6 +638,9 @@ pub struct WgTunnel {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     #[allow(dead_code)]
     address_v4: Ipv4Addr,
+    /// Hostname cache for lookups made through this tunnel. A plain mutex is fine: it is touched
+    /// twice per dial at most, never by the driver task in the packet path.
+    dns_cache: std::sync::Mutex<DnsCache>,
 }
 
 impl WgTunnel {
@@ -363,7 +658,11 @@ impl WgTunnel {
                 tracing::warn!("wireguard tunnel driver exited: {e}");
             }
         });
-        let tunnel = Arc::new(WgTunnel { cmd_tx, address_v4 });
+        let tunnel = Arc::new(WgTunnel {
+            cmd_tx,
+            address_v4,
+            dns_cache: std::sync::Mutex::new(DnsCache::new()),
+        });
 
         // Pre-connect: force the WireGuard handshake now so the first real request over this route
         // isn't delayed by it (WARP/WG otherwise handshakes lazily on the first dial). Dialing
@@ -437,6 +736,12 @@ impl WgTunnel {
     }
 
     async fn resolve(&self, host: &str, timeout: Duration) -> Result<IpAddr, u8> {
+        // A miss costs a whole TCP connection through the tunnel (and a source port), so with
+        // several users hitting the same hosts this is the difference between one lookup per
+        // host and one per request.
+        if let Some(ip) = self.cache_get(host) {
+            return Ok(IpAddr::V4(ip));
+        }
         let mut s = self
             .dial_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53, timeout)
             .await?;
@@ -450,7 +755,25 @@ impl WgTunnel {
         let n = u16::from_be_bytes(lenb) as usize;
         let mut resp = vec![0u8; n];
         s.read_exact(&mut resp).await.map_err(|_| R_UNREACHABLE)?;
-        dns_first_a(&resp).map(IpAddr::V4).ok_or(R_UNREACHABLE)
+        let (ip, ttl) = dns_first_a(&resp).ok_or(R_UNREACHABLE)?;
+        self.cache_put(host, ip, ttl);
+        Ok(IpAddr::V4(ip))
+    }
+
+    fn cache_get(&self, host: &str) -> Option<Ipv4Addr> {
+        let cache = self
+            .dns_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.get(host, std::time::Instant::now())
+    }
+
+    fn cache_put(&self, host: &str, ip: Ipv4Addr, ttl: u32) {
+        let mut cache = self
+            .dns_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(host, ip, ttl, std::time::Instant::now());
     }
 }
 
@@ -460,26 +783,48 @@ pub struct WgStream {
     handle: SocketHandle,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     from_tunnel: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Shared with the driver: taking a chunk off `from_tunnel` frees window space, and the
+    /// driver only refills smoltcp -> channel while there is room.
+    window: RecvWindow,
+    /// The write-side counterpart: parks this stream's writer when it runs too far ahead.
+    send_window: SendWindow,
+    /// Which tunnel session this stream belongs to; a re-registration invalidates it.
+    mark: SessionMark,
     read_buf: Vec<u8>,
     read_pos: usize,
     eof: bool,
 }
 
 impl WgStream {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         handle: SocketHandle,
         cmd_tx: mpsc::UnboundedSender<Cmd>,
         from_tunnel: mpsc::UnboundedReceiver<Vec<u8>>,
+        window: RecvWindow,
+        send_window: SendWindow,
+        mark: SessionMark,
     ) -> Self {
         WgStream {
             handle,
             cmd_tx,
             from_tunnel,
+            window,
+            send_window,
+            mark,
             read_buf: Vec::new(),
             read_pos: 0,
             eof: false,
         }
     }
+}
+
+/// The tunnel was rebuilt under this stream: its connection is gone for good.
+fn tunnel_reset() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "wireguard tunnel re-registered",
+    )
 }
 
 impl AsyncRead for WgStream {
@@ -489,12 +834,22 @@ impl AsyncRead for WgStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let me = self.get_mut();
+        // A rebuilt tunnel cannot carry this connection. Reporting EOF would tell the client the
+        // peer closed normally; a reset says the truth, and Wisp turns it into a network close.
+        if me.mark.is_stale() {
+            return Poll::Ready(Err(tunnel_reset()));
+        }
         if me.read_pos >= me.read_buf.len() {
             if me.eof {
                 return Poll::Ready(Ok(())); // EOF: fill nothing
             }
             match me.from_tunnel.poll_recv(cx) {
                 Poll::Ready(Some(data)) => {
+                    // These bytes have left the backlog; if that reopened a window the driver
+                    // had stopped filling, nudge it rather than waiting for the next tick.
+                    if me.window.consumed(data.len()) {
+                        let _ = me.cmd_tx.send(Cmd::Resume);
+                    }
                     me.read_buf = data;
                     me.read_pos = 0;
                 }
@@ -515,11 +870,27 @@ impl AsyncRead for WgStream {
 impl AsyncWrite for WgStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.cmd_tx.send(Cmd::Write {
-            handle: self.handle,
+        let me = self.get_mut();
+        if me.mark.is_stale() {
+            return Poll::Ready(Err(tunnel_reset()));
+        }
+        // Park until the driver has drained enough of what we already queued. This is what makes
+        // Wisp's per-stream credit reflect the tunnel's real pace instead of an unbounded queue.
+        if me.send_window.poll_reserve(cx).is_pending() {
+            return Poll::Pending;
+        }
+        if me.send_window.is_closed() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "tunnel closed",
+            )));
+        }
+        me.send_window.queued(buf.len());
+        match me.cmd_tx.send(Cmd::Write {
+            handle: me.handle,
             data: buf.to_vec(),
         }) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
@@ -591,70 +962,178 @@ impl Device for TunDevice {
     }
 }
 
+/// Allocator for the tunnel's ephemeral source ports. A port stays reserved until the socket
+/// using it is reaped, so two live sockets can never share one: smoltcp dispatches an inbound
+/// packet to the first socket whose (local, remote) pair matches, so a duplicated 4-tuple would
+/// silently hand one stream's bytes to another.
+struct PortPool {
+    next: u16,
+    in_use: HashSet<u16>,
+}
+
+impl PortPool {
+    fn new() -> Self {
+        PortPool {
+            next: PORT_LO,
+            in_use: HashSet::new(),
+        }
+    }
+
+    /// Reserve a free port, or `None` when every port in the range is live.
+    fn alloc(&mut self) -> Option<u16> {
+        // Sweep forward from the last hand-out so ports rotate (a just-closed port isn't reused
+        // immediately, which would confuse a peer still sending late packets), giving up only
+        // after a full pass proves every port is taken.
+        for _ in 0..=(PORT_HI - PORT_LO) {
+            let port = self.next;
+            self.next = if port == PORT_HI { PORT_LO } else { port + 1 };
+            if self.in_use.insert(port) {
+                return Some(port);
+            }
+        }
+        None
+    }
+
+    fn release(&mut self, port: u16) {
+        self.in_use.remove(&port);
+    }
+}
+
+/// Bytes buffered for one stream between the driver and its `WgStream`, shared by both sides.
+/// The driver only drains smoltcp while the window has room; the reader reopens it as it
+/// consumes.
+#[derive(Clone)]
+struct RecvWindow(Arc<AtomicUsize>);
+
+impl RecvWindow {
+    fn new() -> Self {
+        RecvWindow(Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// Whether the driver may hand more bytes to the reader.
+    fn has_room(&self) -> bool {
+        self.0.load(Ordering::Acquire) < RECV_HIGH_WATER
+    }
+
+    /// The driver queued `n` bytes for the reader.
+    fn queued(&self, n: usize) {
+        self.0.fetch_add(n, Ordering::AcqRel);
+    }
+
+    /// The reader took `n` bytes. Returns true if that reopened a *closed* window, meaning the
+    /// driver must be woken to resume draining smoltcp.
+    fn consumed(&self, n: usize) -> bool {
+        let before = self.0.fetch_sub(n, Ordering::AcqRel);
+        before >= RECV_HIGH_WATER && before - n < RECV_HIGH_WATER
+    }
+}
+
 /// Per-socket state the driver keeps alongside the smoltcp socket.
 struct SockState {
-    to_stream: mpsc::UnboundedSender<Vec<u8>>,
+    /// Source port this socket holds; returned to the pool when the socket is reaped.
+    local_port: u16,
+    /// `None` once the stream is gone: its reader sees EOF and further bytes are dropped.
+    to_stream: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// Gates draining smoltcp into `to_stream`, so a slow reader closes the TCP window instead
+    /// of growing the backlog without bound.
+    window: RecvWindow,
+    /// The mirror image: gates how much the writer may queue ahead of the socket. Held as a
+    /// guard so losing this state — however it happens — always releases the writer.
+    send_window: SendGuard,
     pending_write: VecDeque<u8>,
     /// The reply + the stream to hand back, held until the socket is Established.
     pending: Option<(oneshot::Sender<Result<WgStream, u8>>, WgStream)>,
     established: bool,
+    /// Set when the stream asked to close: the FIN is in flight and the socket is aborted if it
+    /// has not reached `Closed` by this deadline.
+    close_deadline: Option<SmolInstant>,
 }
 
-/// Open a smoltcp TCP socket connecting to `ip4:port` from the tunnel address.
+/// Open a smoltcp TCP socket connecting to `ip4:port` from the tunnel address, returning it
+/// with the source port it reserved.
 fn open_socket(
     sockets: &mut SocketSet<'static>,
     iface: &mut Interface,
     ip4: Ipv4Addr,
     port: u16,
     src: Ipv4Addr,
-    next_port: &mut u16,
-) -> Result<SocketHandle, ()> {
+    ports: &mut PortPool,
+) -> Result<(SocketHandle, u16), ()> {
+    let local = ports.alloc().ok_or(())?;
     let rx = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
     let tx = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
     let mut sock = tcp::Socket::new(rx, tx);
-    let local = *next_port;
-    *next_port = if local == u16::MAX { 49152 } else { local + 1 };
-    sock.connect(
-        iface.context(),
-        (IpAddress::from(ip4), port),
-        (IpAddress::from(src), local),
-    )
-    .map_err(|_| ())?;
-    Ok(sockets.add(sock))
+    if sock
+        .connect(
+            iface.context(),
+            (IpAddress::from(ip4), port),
+            (IpAddress::from(src), local),
+        )
+        .is_err()
+    {
+        ports.release(local);
+        return Err(());
+    }
+    Ok((sockets.add(sock), local))
 }
 
-/// Move data between smoltcp sockets and their `WgStream`s, and fire dial replies once a
-/// socket is established (or errors).
-fn pump_sockets(sockets: &mut SocketSet<'static>, states: &mut HashMap<SocketHandle, SockState>) {
+/// Move data between smoltcp sockets and their `WgStream`s, fire dial replies once a socket is
+/// established (or errors), and reap finished sockets — freeing their buffers and source ports.
+/// Returns true when the reaped failures say the tunnel itself is dead (see [`SessionHealth`]).
+fn pump_sockets(
+    now: SmolInstant,
+    sockets: &mut SocketSet<'static>,
+    states: &mut HashMap<SocketHandle, SockState>,
+    ports: &mut PortPool,
+    health: &mut SessionHealth,
+) -> bool {
     let mut remove = Vec::new();
+    let mut dead = false;
     for (handle, st) in states.iter_mut() {
         let sock = sockets.get_mut::<tcp::Socket>(*handle);
 
         if !st.established && sock.state() == tcp::State::Established {
             st.established = true;
+            health.alive();
             if let Some((reply, stream)) = st.pending.take() {
                 let _ = reply.send(Ok(stream));
             }
         }
 
-        // Push queued writes into the socket.
-        if sock.can_send() && !st.pending_write.is_empty() {
+        // Push queued writes into the socket (never after the stream asked to close).
+        if st.close_deadline.is_none() && sock.can_send() && !st.pending_write.is_empty() {
             let (a, b) = st.pending_write.as_slices();
             let data = if a.is_empty() { b } else { a };
             if let Ok(sent) = sock.send_slice(data) {
                 st.pending_write.drain(..sent);
+                // Those bytes are the socket's problem now: let the writer queue more.
+                st.send_window.window().drained(sent);
             }
         }
 
-        // Drain received bytes to the stream.
-        while sock.can_recv() {
+        // Drain received bytes to the stream, but only while its window has room. Stopping here
+        // leaves the bytes in smoltcp's receive buffer, which shrinks the advertised window and
+        // makes the peer slow down — real backpressure rather than unbounded buffering.
+        while let Some(tx) = st.to_stream.as_ref() {
+            if !st.window.has_room() || !sock.can_recv() {
+                break;
+            }
             let mut tmp = [0u8; 8192];
             match sock.recv_slice(&mut tmp) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let _ = st.to_stream.send(tmp[..n].to_vec());
+                    st.window.queued(n);
+                    if tx.send(tmp[..n].to_vec()).is_err() {
+                        st.to_stream = None; // reader vanished
+                        break;
+                    }
                 }
             }
+        }
+
+        // A peer that never answers the FIN would pin this socket forever; force it shut.
+        if st.close_deadline.is_some_and(|dl| now >= dl) && sock.state() != tcp::State::Closed {
+            sock.abort();
         }
 
         // Connection finished or failed.
@@ -662,13 +1141,19 @@ fn pump_sockets(sockets: &mut SocketSet<'static>, states: &mut HashMap<SocketHan
             if let Some((reply, _)) = st.pending.take() {
                 let _ = reply.send(Err(R_UNREACHABLE)); // never established
             }
+            if !st.established {
+                dead |= health.dial_failed();
+            }
             remove.push(*handle);
         }
     }
     for h in remove {
-        states.remove(&h);
+        if let Some(st) = states.remove(&h) {
+            ports.release(st.local_port); // dropping `st` releases any parked writer
+        }
         sockets.remove(h);
     }
+    dead
 }
 
 /// Encrypt everything smoltcp queued and send it over UDP.
@@ -686,13 +1171,29 @@ async fn driver(
     self_tx: mpsc::UnboundedSender<Cmd>,
     reregister: Option<PathBuf>,
 ) -> Result<(), String> {
+    // Bumped once per session; streams captured under an older value report a reset instead of
+    // a clean EOF, because a re-registered tunnel cannot carry their connections.
+    let generation = Arc::new(AtomicU64::new(0));
+    let mut gate = ReregisterGate::new();
+    let can_reregister = reregister.is_some();
     loop {
-        match run_session(&cfg, &mut cmd_rx, &self_tx).await? {
+        let end = run_session(
+            &cfg,
+            &mut cmd_rx,
+            &self_tx,
+            &generation,
+            &mut gate,
+            can_reregister,
+        )
+        .await?;
+        match end {
             SessionEnd::Shutdown => return Ok(()),
             SessionEnd::Reregister(reply) => {
                 // Only a WARP route can recover this way; a static WG route has no cache to renew.
                 let Some(path) = reregister.clone() else {
-                    let _ = reply.send(Err(()));
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(()));
+                    }
                     continue;
                 };
                 // register_fresh does blocking HTTP, so run it off the async driver task. The next
@@ -703,15 +1204,21 @@ async fn driver(
                             "WARP re-registered (previous device culled); reconnecting tunnel"
                         );
                         cfg = new_cfg;
-                        let _ = reply.send(Ok(()));
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Ok(()));
+                        }
                     }
                     Ok(Err(e)) => {
                         tracing::warn!("WARP re-registration failed: {e}");
-                        let _ = reply.send(Err(()));
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(()));
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("WARP re-registration task failed: {e}");
-                        let _ = reply.send(Err(()));
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(()));
+                        }
                     }
                 }
             }
@@ -727,7 +1234,12 @@ async fn run_session(
     cfg: &WgConfig,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     self_tx: &mpsc::UnboundedSender<Cmd>,
+    generation: &Arc<AtomicU64>,
+    gate: &mut ReregisterGate,
+    can_reregister: bool,
 ) -> Result<SessionEnd, String> {
+    // Every stream opened from here on belongs to this session.
+    let my_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
     let udp = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| format!("udp bind: {e}"))?;
@@ -767,7 +1279,8 @@ async fn run_session(
 
     let mut sockets = SocketSet::new(Vec::new());
     let mut states: HashMap<SocketHandle, SockState> = HashMap::new();
-    let mut next_port: u16 = 49152;
+    let mut ports = PortPool::new();
+    let mut health = SessionHealth::new();
 
     let mut udp_buf = vec![0u8; 2048];
     let mut scratch = vec![0u8; 2048];
@@ -779,6 +1292,13 @@ async fn run_session(
                 let n = match r { Ok(n) => n, Err(_) => continue };
                 // Decapsulate, flushing any handshake/cookie replies boringtun wants to send.
                 let mut res = tunn.decapsulate(None, &udp_buf[..n], &mut scratch);
+                // Anything the peer sends that decrypts — handshake reply, keepalive, data, even
+                // a refusal — proves the device is still live. A culled one gets total silence,
+                // so this, not payload alone, is the liveness signal: it keeps a run of dials to
+                // blackholed hosts on an idle tunnel from being read as a dead tunnel.
+                if !matches!(res, TunnResult::Err(_)) {
+                    health.alive();
+                }
                 while let TunnResult::WriteToNetwork(b) = res {
                     let _ = udp.send(b).await;
                     res = tunn.decapsulate(None, &[], &mut scratch);
@@ -797,22 +1317,45 @@ async fn run_session(
                 match cmd {
                     None => return Ok(SessionEnd::Shutdown),
                     Some(Cmd::Reregister { reply }) => {
-                        return Ok(SessionEnd::Reregister(reply))
+                        if gate.allow(std::time::Instant::now()) {
+                            return Ok(SessionEnd::Reregister(Some(reply)));
+                        }
+                        // Refusing here keeps this session (and its live streams) intact rather
+                        // than tearing it down for a registration Cloudflare would throttle.
+                        tracing::warn!("WARP re-registration refused: still in cooldown");
+                        let _ = reply.send(Err(()));
                     }
                     Some(Cmd::Dial { ip, port, reply }) => {
                         let ip4 = match ip {
                             IpAddr::V4(v4) => v4,
                             IpAddr::V6(_) => { let _ = reply.send(Err(R_UNREACHABLE)); continue; }
                         };
-                        match open_socket(&mut sockets, &mut iface, ip4, port, cfg.address_v4, &mut next_port) {
-                            Ok(handle) => {
+                        match open_socket(&mut sockets, &mut iface, ip4, port, cfg.address_v4, &mut ports) {
+                            Ok((handle, local_port)) => {
                                 let (to_stream, from_tunnel) = mpsc::unbounded_channel();
-                                let stream = WgStream::new(handle, self_tx.clone(), from_tunnel);
+                                let window = RecvWindow::new();
+                                let send_window = SendWindow::new();
+                                let mark = SessionMark {
+                                    current: Arc::clone(generation),
+                                    mine: my_generation,
+                                };
+                                let stream = WgStream::new(
+                                    handle,
+                                    self_tx.clone(),
+                                    from_tunnel,
+                                    window.clone(),
+                                    send_window.clone(),
+                                    mark,
+                                );
                                 states.insert(handle, SockState {
-                                    to_stream,
+                                    local_port,
+                                    to_stream: Some(to_stream),
+                                    window,
+                                    send_window: SendGuard::new(send_window),
                                     pending_write: VecDeque::new(),
                                     pending: Some((reply, stream)),
                                     established: false,
+                                    close_deadline: None,
                                 });
                             }
                             Err(_) => { let _ = reply.send(Err(R_UNREACHABLE)); }
@@ -823,26 +1366,322 @@ async fn run_session(
                             st.pending_write.extend(data);
                         }
                     }
+                    Some(Cmd::Resume) => {} // the pump below is the whole response
                     Some(Cmd::Close { handle }) => {
-                        if states.remove(&handle).is_some()
-                            && sockets.iter().any(|(h, _)| h == handle)
-                        {
-                            sockets.get_mut::<tcp::Socket>(handle).close();
+                        // Keep the state until the socket really closes: that's what returns its
+                        // source port to the pool and its buffers to the allocator.
+                        if let Some(st) = states.get_mut(&handle) {
+                            st.to_stream = None;
+                            st.send_window.window().close();
+                            if st.close_deadline.is_none() {
+                                st.close_deadline =
+                                    Some(SmolInstant::now() + SmolDuration::from_secs(CLOSE_GRACE));
+                                sockets.get_mut::<tcp::Socket>(handle).close();
+                            }
                         }
                     }
                 }
             }
         }
 
-        iface.poll(SmolInstant::now(), &mut device, &mut sockets);
-        pump_sockets(&mut sockets, &mut states);
+        let now = SmolInstant::now();
+        iface.poll(now, &mut device, &mut sockets);
+        let presumed_dead = pump_sockets(now, &mut sockets, &mut states, &mut ports, &mut health);
         drain_tx(&mut device, &mut tunn, &udp, &mut scratch).await;
+
+        // Dials keep dying with nothing at all coming back: the device has almost certainly been
+        // culled. Self-heal mid-run rather than staying dead until the process restarts.
+        if presumed_dead && can_reregister && gate.allow(std::time::Instant::now()) {
+            tracing::warn!(
+                streams = states.len(),
+                failed_dials = DEAD_AFTER_FAILED_DIALS,
+                "wireguard tunnel presumed dead (dials failing with no reply at all); \
+                 re-registering — live streams on it will be reset"
+            );
+            return Ok(SessionEnd::Reregister(None));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PORT_SPAN: usize = (PORT_HI - PORT_LO) as usize + 1;
+
+    #[test]
+    fn port_pool_hands_out_every_port_exactly_once_per_cycle() {
+        let mut pool = PortPool::new();
+        let mut seen = HashSet::new();
+        for _ in 0..PORT_SPAN {
+            let p = pool.alloc().expect("port available");
+            assert!(p >= PORT_LO, "port {p} below the ephemeral range");
+            assert!(seen.insert(p), "port {p} handed out while still live");
+        }
+    }
+
+    #[test]
+    fn port_pool_exhausts_rather_than_reusing_a_live_port() {
+        let mut pool = PortPool::new();
+        for _ in 0..PORT_SPAN {
+            pool.alloc().expect("port available");
+        }
+        assert_eq!(pool.alloc(), None);
+    }
+
+    #[test]
+    fn port_pool_reuses_a_released_port() {
+        let mut pool = PortPool::new();
+        let first = pool.alloc().expect("port available");
+        for _ in 1..PORT_SPAN {
+            pool.alloc().expect("port available");
+        }
+        pool.release(first);
+        assert_eq!(pool.alloc(), Some(first));
+    }
+
+    #[test]
+    fn recv_window_closes_at_the_high_water_mark() {
+        let w = RecvWindow::new();
+        assert!(w.has_room());
+        w.queued(RECV_HIGH_WATER - 1);
+        assert!(w.has_room());
+        w.queued(1);
+        assert!(!w.has_room());
+    }
+
+    #[test]
+    fn recv_window_reopens_once_the_reader_consumes() {
+        let w = RecvWindow::new();
+        w.queued(RECV_HIGH_WATER);
+        assert!(!w.has_room());
+        assert!(w.consumed(1));
+        assert!(w.has_room());
+    }
+
+    #[test]
+    fn recv_window_reports_a_reopen_only_on_the_crossing() {
+        let w = RecvWindow::new();
+        w.queued(RECV_HIGH_WATER + 10);
+        // Still above the mark afterwards: no wake-up needed.
+        assert!(!w.consumed(5));
+        // This one crosses below the mark.
+        assert!(w.consumed(10));
+        // Already open: consuming more must not ask for another wake-up.
+        assert!(!w.consumed(1));
+    }
+
+    /// An A-record response for `example.com` carrying `ttl`.
+    fn a_response(ttl: u32, ip: [u8; 4]) -> Vec<u8> {
+        let mut resp = dns_query("example.com");
+        resp[2] = 0x81;
+        resp[3] = 0x80; // QR=1, RA
+        resp[6] = 0x00;
+        resp[7] = 0x01; // ANCOUNT=1
+        resp.extend_from_slice(&[0xc0, 0x0c]); // name pointer
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A, IN
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
+        resp.extend_from_slice(&ip);
+        resp
+    }
+
+    #[test]
+    fn dns_first_a_reports_the_record_ttl() {
+        let resp = a_response(300, [93, 184, 216, 34]);
+        assert_eq!(dns_first_a(&resp).unwrap().1, 300);
+    }
+
+    #[test]
+    fn dns_cache_serves_an_unexpired_entry() {
+        let mut c = DnsCache::new();
+        let now = std::time::Instant::now();
+        assert_eq!(c.get("example.com", now), None);
+        c.insert("example.com", Ipv4Addr::new(1, 2, 3, 4), 300, now);
+        assert_eq!(
+            c.get("example.com", now + Duration::from_secs(299)),
+            Some(Ipv4Addr::new(1, 2, 3, 4))
+        );
+    }
+
+    #[test]
+    fn dns_cache_drops_an_expired_entry() {
+        let mut c = DnsCache::new();
+        let now = std::time::Instant::now();
+        c.insert("example.com", Ipv4Addr::new(1, 2, 3, 4), 300, now);
+        assert_eq!(c.get("example.com", now + Duration::from_secs(301)), None);
+    }
+
+    #[test]
+    fn dns_cache_raises_a_tiny_ttl_to_the_floor() {
+        let mut c = DnsCache::new();
+        let now = std::time::Instant::now();
+        c.insert("example.com", Ipv4Addr::new(1, 2, 3, 4), 1, now);
+        assert!(c
+            .get("example.com", now + Duration::from_secs(DNS_TTL_MIN - 1))
+            .is_some());
+    }
+
+    #[test]
+    fn dns_cache_lowers_an_absurd_ttl_to_the_ceiling() {
+        let mut c = DnsCache::new();
+        let now = std::time::Instant::now();
+        c.insert("example.com", Ipv4Addr::new(1, 2, 3, 4), u32::MAX, now);
+        assert_eq!(
+            c.get("example.com", now + Duration::from_secs(DNS_TTL_MAX + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn dns_cache_stays_within_its_cap() {
+        let mut c = DnsCache::new();
+        let now = std::time::Instant::now();
+        for i in 0..(DNS_CACHE_MAX + 50) {
+            c.insert(&format!("h{i}.example.com"), Ipv4Addr::new(1, 2, 3, 4), 300, now);
+        }
+        assert!(c.len() <= DNS_CACHE_MAX, "cache grew to {}", c.len());
+    }
+
+    /// A waker that records how many times it was woken.
+    #[derive(Default)]
+    struct CountingWaker(AtomicUsize);
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl CountingWaker {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn send_window_admits_writes_below_the_high_water_mark() {
+        let w = SendWindow::new();
+        let waker = Arc::new(CountingWaker::default());
+        let raw = std::task::Waker::from(waker);
+        let mut cx = Context::from_waker(&raw);
+        assert!(w.poll_reserve(&mut cx).is_ready());
+        w.queued(SEND_HIGH_WATER - 1);
+        assert!(w.poll_reserve(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn send_window_parks_the_writer_when_full() {
+        let w = SendWindow::new();
+        let waker = Arc::new(CountingWaker::default());
+        let raw = std::task::Waker::from(waker);
+        let mut cx = Context::from_waker(&raw);
+        w.queued(SEND_HIGH_WATER);
+        assert!(w.poll_reserve(&mut cx).is_pending());
+    }
+
+    #[test]
+    fn send_window_wakes_the_writer_once_it_drains() {
+        let w = SendWindow::new();
+        let waker = Arc::new(CountingWaker::default());
+        let raw = std::task::Waker::from(waker.clone());
+        let mut cx = Context::from_waker(&raw);
+        w.queued(SEND_HIGH_WATER);
+        assert!(w.poll_reserve(&mut cx).is_pending());
+        assert_eq!(waker.count(), 0);
+
+        // Draining below the mark must wake the parked writer exactly once...
+        w.drained(1);
+        assert_eq!(waker.count(), 1);
+        assert!(w.poll_reserve(&mut cx).is_ready());
+
+        // ...and draining further, with nobody parked, must not keep waking.
+        w.drained(1);
+        assert_eq!(waker.count(), 1);
+    }
+
+    #[test]
+    fn send_window_releases_a_parked_writer_when_the_socket_dies() {
+        let w = SendWindow::new();
+        let waker = Arc::new(CountingWaker::default());
+        let raw = std::task::Waker::from(waker.clone());
+        let mut cx = Context::from_waker(&raw);
+        w.queued(SEND_HIGH_WATER);
+        assert!(w.poll_reserve(&mut cx).is_pending());
+        w.close();
+        assert_eq!(waker.count(), 1);
+        assert!(w.poll_reserve(&mut cx).is_ready());
+        assert!(w.is_closed());
+    }
+
+    #[test]
+    fn dropping_the_driver_side_guard_releases_a_parked_writer() {
+        let w = SendWindow::new();
+        let waker = Arc::new(CountingWaker::default());
+        let raw = std::task::Waker::from(waker.clone());
+        let mut cx = Context::from_waker(&raw);
+        let guard = SendGuard::new(w.clone());
+        w.queued(SEND_HIGH_WATER);
+        assert!(w.poll_reserve(&mut cx).is_pending());
+
+        // However the driver loses the socket — reap, session rebuild, panic — the writer must
+        // be released rather than parked on a window nobody will ever drain again.
+        drop(guard);
+        assert_eq!(waker.count(), 1);
+        assert!(w.poll_reserve(&mut cx).is_ready());
+        assert!(w.is_closed());
+    }
+
+    #[test]
+    fn session_mark_spots_a_stream_from_an_earlier_session() {
+        let current = Arc::new(AtomicU64::new(1));
+        let mark = SessionMark {
+            current: Arc::clone(&current),
+            mine: 1,
+        };
+        assert!(!mark.is_stale());
+        current.store(2, Ordering::Release);
+        assert!(mark.is_stale());
+    }
+
+    #[test]
+    fn session_health_flags_a_tunnel_that_is_silent_through_repeated_dials() {
+        let mut h = SessionHealth::new();
+        for _ in 0..(DEAD_AFTER_FAILED_DIALS - 1) {
+            assert!(!h.dial_failed());
+        }
+        assert!(h.dial_failed());
+    }
+
+    #[test]
+    fn session_health_clears_the_streak_when_the_tunnel_answers() {
+        let mut h = SessionHealth::new();
+        for _ in 0..(DEAD_AFTER_FAILED_DIALS - 1) {
+            assert!(!h.dial_failed());
+        }
+        // An inbound packet — a refusal counts — proves the tunnel is carrying traffic.
+        h.alive();
+        for _ in 0..(DEAD_AFTER_FAILED_DIALS - 1) {
+            assert!(!h.dial_failed());
+        }
+    }
+
+    #[test]
+    fn reregister_gate_allows_the_first_attempt_then_holds_off() {
+        let mut g = ReregisterGate::new();
+        let now = std::time::Instant::now();
+        assert!(g.allow(now));
+        assert!(!g.allow(now + REREGISTER_COOLDOWN - Duration::from_secs(1)));
+        assert!(g.allow(now + REREGISTER_COOLDOWN));
+    }
+
+    #[test]
+    fn round_robin_cycles_through_every_slot() {
+        let counter = AtomicUsize::new(0);
+        let picks: Vec<usize> = (0..7).map(|_| rr_index(&counter, 3)).collect();
+        assert_eq!(picks, vec![0, 1, 2, 0, 1, 2, 0]);
+    }
 
     #[test]
     fn dns_query_well_formed() {
@@ -865,7 +1704,7 @@ mod tests {
         resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // TTL
         resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
         resp.extend_from_slice(&[93, 184, 216, 34]);
-        assert_eq!(dns_first_a(&resp).unwrap().to_string(), "93.184.216.34");
+        assert_eq!(dns_first_a(&resp).unwrap().0.to_string(), "93.184.216.34");
     }
 
     #[test]
@@ -887,7 +1726,7 @@ mod tests {
         resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
         resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]);
         resp.extend_from_slice(&[0x00, 0x04, 1, 2, 3, 4]);
-        assert_eq!(dns_first_a(&resp).unwrap().to_string(), "1.2.3.4");
+        assert_eq!(dns_first_a(&resp).unwrap().0.to_string(), "1.2.3.4");
     }
 
     #[test]

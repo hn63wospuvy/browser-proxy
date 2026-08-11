@@ -95,6 +95,7 @@ routes:
   # Cloudflare WARP, registered in-process (one binary, no warp-cli / wireproxy):
   - name: warp
     type: warp
+    tunnels: 4             # optional: independent tunnels, dialed round-robin (default 1, max 16)
 
   # A generic WireGuard peer you configure yourself (e.g. wgcf-generated):
   - name: myvpn
@@ -164,6 +165,17 @@ On the `direct` route the server resolves the hostname itself — by default via
 - The **WARP registration API is unofficial** and may change; if `type: warp` stops
   registering, delete `warp-<name>.json` or switch to a `wgcf`-generated `type: wireguard`
   route.
+- **One tunnel is one CPU core and one exit IP.** A tunnel's driver task encrypts every
+  stream on it by itself, and every user on it shares its WARP address, so sites' rate limits
+  and CAPTCHAs apply to everyone at once. With several people on the proxy, raise `tunnels:`
+  on the `warp` route; the first start registers that many devices (spaced out to avoid the
+  rate limit below) and caches them as `warp-<name>-<n>.json`.
+- **A culled device is re-registered automatically, and that resets live connections.** If
+  several dials in a row fail while the tunnel sends nothing back, it is presumed dead and
+  re-registers mid-run — the replacement has new keys and a new exit address, so streams open
+  at that moment cannot survive and are closed as reset (not as a clean end-of-response).
+  Re-registration is rate-limited to once a minute, because retrying faster is what triggers
+  the throttle below.
 - A **freshly-registered WARP device can take a short while to activate** on Cloudflare's
   edge, and rapidly registering many devices gets rate-limited (the WireGuard endpoint then
   silently ignores handshakes). The credential cache means you normally register once, so

@@ -18,7 +18,7 @@ use tokio::net::TcpStream;
 use crate::config::{is_private_ip, Config};
 use crate::dns::DnsResolver;
 use crate::tor::{self, TorClient};
-use crate::wireguard::{WgStream, WgTunnel};
+use crate::wireguard::{WgPool, WgStream, WgTunnel};
 use crate::wisp::{R_BLOCKED, R_INVALID, R_REFUSED, R_TIMEOUT, R_UNREACHABLE};
 
 /// The reserved route name that always maps to a direct connection.
@@ -38,8 +38,8 @@ pub enum Route {
         addr: SocketAddr,
         auth: Option<(String, String)>,
     },
-    /// Dial through an embedded WireGuard tunnel (shared, one per route).
-    Wireguard(Arc<WgTunnel>),
+    /// Dial through the route's pool of embedded WireGuard tunnels, round-robin.
+    Wireguard(WgPool),
     /// Dial through an embedded, in-process Tor client (shared, one per route).
     Tor(Arc<TorClient>),
 }
@@ -148,6 +148,9 @@ enum RouteSpec {
     },
     Warp {
         name: String,
+        /// How many independent WARP tunnels to build for this route (default 1). Each is its
+        /// own device+driver task, so this is the knob for spreading many users' load.
+        tunnels: Option<usize>,
     },
     Tor {
         name: String,
@@ -161,9 +164,26 @@ impl RouteSpec {
             RouteSpec::Socks5 { name, .. }
             | RouteSpec::Http { name, .. }
             | RouteSpec::Wireguard { name, .. }
-            | RouteSpec::Warp { name }
+            | RouteSpec::Warp { name, .. }
             | RouteSpec::Tor { name, .. } => name,
         }
+    }
+}
+
+/// Upper bound on `tunnels:` for a WARP route. Each tunnel is a separate Cloudflare device
+/// registration; a typo asking for hundreds would hammer their API and get the host throttled.
+pub const MAX_WARP_TUNNELS: usize = 16;
+
+/// Gap between WARP registrations that actually hit the API, for the same reason.
+const WARP_REG_SPACING: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Registration cache file for tunnel `index` of WARP route `name`. Index 0 keeps the historic
+/// `warp-<name>.json` so an existing deployment reuses the device it already registered.
+fn warp_cache_path(name: &str, index: usize) -> PathBuf {
+    if index == 0 {
+        PathBuf::from(format!("warp-{name}.json"))
+    } else {
+        PathBuf::from(format!("warp-{name}-{index}.json"))
     }
 }
 
@@ -250,15 +270,33 @@ fn build_route(spec: RouteSpec, name: &str) -> Result<Route, String> {
                     .map_err(|_| format!("wireguard route {name:?}: bad address"))?,
             };
             // Static WG has fixed user-provided keys — nothing to re-register.
-            Ok(Route::Wireguard(WgTunnel::spawn(cfg, None)))
+            Ok(Route::Wireguard(WgPool::new(vec![WgTunnel::spawn(cfg, None)])))
         }
-        RouteSpec::Warp { .. } => {
-            let cache = std::path::PathBuf::from(format!("warp-{name}.json"));
-            let cfg = crate::wireguard::register_warp(&cache)
-                .map_err(|e| format!("warp route {name:?}: {e}"))?;
-            // Pass the cache path so the tunnel can self-heal by re-registering if the WARP
-            // device gets culled (a stale registration whose endpoint stops answering).
-            Ok(Route::Wireguard(WgTunnel::spawn(cfg, Some(cache))))
+        RouteSpec::Warp { tunnels, .. } => {
+            let count = tunnels.unwrap_or(1);
+            // Validate before touching the network: a bad `tunnels:` must never cost a device
+            // registration.
+            if count == 0 || count > MAX_WARP_TUNNELS {
+                return Err(format!(
+                    "warp route {name:?}: tunnels must be between 1 and {MAX_WARP_TUNNELS}"
+                ));
+            }
+            let mut pool = Vec::with_capacity(count);
+            for index in 0..count {
+                let cache = warp_cache_path(name, index);
+                // Cloudflare throttles a burst of registrations from one IP, so space out the
+                // ones that actually have to register. A cached device costs nothing.
+                if index > 0 && !cache.exists() {
+                    std::thread::sleep(WARP_REG_SPACING);
+                }
+                let cfg = crate::wireguard::register_warp(&cache)
+                    .map_err(|e| format!("warp route {name:?} tunnel {index}: {e}"))?;
+                // Pass the cache path so the tunnel can self-heal by re-registering if the WARP
+                // device gets culled (a stale registration whose endpoint stops answering).
+                pool.push(WgTunnel::spawn(cfg, Some(cache)));
+            }
+            tracing::info!(route = name, tunnels = count, "warp route ready");
+            Ok(Route::Wireguard(WgPool::new(pool)))
         }
         RouteSpec::Tor { data_dir, .. } => {
             let dir = PathBuf::from(data_dir.unwrap_or_else(|| "arti-data".to_string()));
@@ -288,7 +326,7 @@ impl Route {
             Route::Http { addr, auth } => connect_http(*addr, auth.as_ref(), host, port, cfg)
                 .await
                 .map(Conn::Tcp),
-            Route::Wireguard(tunnel) => tunnel
+            Route::Wireguard(pool) => pool
                 .dial(host, port, cfg.connect_timeout)
                 .await
                 .map(Conn::Wg),
@@ -623,6 +661,39 @@ mod tests {
             Route::Wireguard(_) => "wireguard".into(),
             Route::Tor(_) => "tor".into(),
         }
+    }
+
+    #[test]
+    fn warp_cache_path_keeps_the_legacy_name_for_the_first_tunnel() {
+        assert_eq!(
+            warp_cache_path("warp", 0),
+            std::path::PathBuf::from("warp-warp.json")
+        );
+    }
+
+    #[test]
+    fn warp_cache_path_is_distinct_per_extra_tunnel() {
+        assert_eq!(
+            warp_cache_path("warp", 2),
+            std::path::PathBuf::from("warp-warp-2.json")
+        );
+    }
+
+    // Both of these must be rejected by validation *before* any registration, so they never
+    // touch the Cloudflare API.
+    #[test]
+    fn yaml_rejects_warp_with_zero_tunnels() {
+        let yaml = "routes:\n  - name: w\n    type: warp\n    tunnels: 0\n";
+        assert!(routes_from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn yaml_rejects_warp_with_more_tunnels_than_allowed() {
+        let yaml = format!(
+            "routes:\n  - name: w\n    type: warp\n    tunnels: {}\n",
+            MAX_WARP_TUNNELS + 1
+        );
+        assert!(routes_from_yaml(&yaml).is_err());
     }
 
     #[test]
