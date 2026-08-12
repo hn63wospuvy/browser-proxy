@@ -24,6 +24,9 @@ const dnsPresets = document.getElementById("dns-presets"); // <datalist> of pres
 const DNS_KEY = "proxy-dns";
 let dnsDefault = "system"; // server's default resolver name (from /dns.json)
 let dnsPresetNames = ["system"]; // preset names from /dns.json (for validation)
+// Whether /dns.json has come back and filled the input. Until it has, the empty field says nothing
+// about the user's choice, so auto-save must not read it (see currentConfig).
+let dnsSettled = false;
 
 // Autocomplete dropdown container + the dim Esc config flash panel.
 const acContainer = document.getElementById("ac-list");
@@ -79,6 +82,7 @@ function currentRoute() {
 // dying half-loaded.
 async function onRouteChange(value) {
   localStorage.setItem(ROUTE_KEY, value);
+  autoSave(); // fold the change into the active profile; adds persistence, never a second reload
   if (!frame || !document.body.classList.contains("browsing")) return;
   try {
     await ensureTransport();
@@ -93,7 +97,9 @@ async function onRouteChange(value) {
 
 routeSelect.addEventListener("change", () => onRouteChange(routeSelect.value));
 
-loadRoutes();
+// Kept so the load-time sync can wait for the options to exist before repainting the controls
+// from a server document (applyProfile skips a route the select doesn't offer yet).
+const routesReady = loadRoutes();
 
 // --- Search engine (client-side only; always shown — there are always several engines) ---
 
@@ -116,9 +122,10 @@ function currentEngine() {
   const saved = localStorage.getItem(ENGINE_KEY);
   const value = SEARCH_ENGINES.some((e) => e.id === saved) ? saved : DEFAULT_ENGINE;
   fillEngineSelect(engineSelect, value);
-  engineSelect.addEventListener("change", () =>
-    localStorage.setItem(ENGINE_KEY, engineSelect.value)
-  );
+  engineSelect.addEventListener("change", () => {
+    localStorage.setItem(ENGINE_KEY, engineSelect.value);
+    autoSave();
+  });
 })();
 
 // --- DNS: editable combobox — a preset name or a typed DNS-server IP. Only affects `direct`. ---
@@ -148,6 +155,7 @@ async function onDnsChange() {
   const v = (dnsInput.value || "").trim();
   dnsInput.classList.toggle("invalid", !dnsIsValid(v));
   localStorage.setItem(DNS_KEY, v);
+  autoSave(); // same deal as the route: persist here, the reload below stays the only reload
   if (!frame || !document.body.classList.contains("browsing")) return;
   try {
     await ensureTransport();
@@ -183,11 +191,12 @@ async function loadDns() {
   const saved = localStorage.getItem(DNS_KEY);
   dnsInput.value = saved != null && saved !== "" ? saved : dnsDefault;
   dnsInput.classList.toggle("invalid", !dnsIsValid(dnsInput.value.trim()));
+  dnsSettled = true;
 }
 
 dnsInput.addEventListener("change", onDnsChange);
 
-loadDns();
+const dnsReady = loadDns(); // see routesReady
 
 // --- Header overrides: user-entered name/value pairs injected into every proxied request ---
 //
@@ -326,6 +335,14 @@ async function saveHeaders() {
     headersError.hidden = false;
     return;
   }
+  // The per-header caps don't bound the document: 100 headers of 10 KiB is already 1 MB, four
+  // times what the server accepts. Refuse here, with the reason, rather than saving something
+  // that would be silently trimmed by normalize() or rejected by the server.
+  if (!docFits(withHeaders(res.headers))) {
+    headersError.textContent = `Cấu hình vượt quá ${Math.floor(MAX_DOC_BYTES / 1024)} KB — rút ngắn hoặc bớt header.`;
+    headersError.hidden = false;
+    return;
+  }
   headerOverrides = res.headers;
   try {
     localStorage.setItem(HEADERS_KEY, JSON.stringify(headerOverrides));
@@ -333,6 +350,7 @@ async function saveHeaders() {
     /* storage blocked/full: keep the in-memory copy for this session */
   }
   updateHeadersBadge();
+  autoSave();
   closeHeadersEditor();
   // Apply immediately while browsing: rebuild the transport (dropping the old WebSocket) and
   // reload the current page so it re-fetches with the new headers.
@@ -360,76 +378,310 @@ headersAddBtn.addEventListener("click", () => {
 });
 updateHeadersBadge();
 
-// --- Configuration profiles: named snapshots of the whole config, stored in localStorage ---
+// --- Configuration profiles: one auto-saved, server-synced document ---
 //
-// A profile bundles the user's settings — Route, DNS, Search engine, and the header overrides —
-// under a name. Saving captures the current config; applying restores all of it at once (and, while
-// browsing, rebuilds the transport + reloads). Everything lives client-side in localStorage.
-const PROFILES_KEY = "proxy-profiles";
+// A profile bundles the user's whole configuration — Route, DNS, Search engine and the header
+// overrides — under a name, and `default` always exists. Profiles used to be opt-in snapshots
+// written only when the user pressed "Cập nhật", so the live config and the saved profile drifted
+// apart constantly; now every change writes straight into the active profile, which is exactly why
+// "Cập nhật" (and, with `default` always present, "Xóa hết") are gone.
+//
+// `proxy-config` is the source of truth. The four mirror keys (proxy-route / proxy-dns /
+// proxy-engine / proxy-headers) are still written on every change: they're the read-fast copy that
+// static/proxy-esc.js and the transport already read. Every write path must touch both.
+const CONFIG_KEY = "proxy-config";
+const LEGACY_PROFILES_KEY = "proxy-profiles";
+const LEGACY_ACTIVE_KEY = "proxy-active-profile";
+const CLIENT_ID_KEY = "proxy-client-id";
+const DEFAULT_PROFILE = "default";
 const MAX_PROFILES = 50;
 const MAX_PROFILE_NAME = 64;
+const MAX_PROFILE_FIELD = 128; // route / engine / dns — opaque strings, capped as the server caps them
+const SYNC_DEBOUNCE_MS = 500;
+// Must match MAX_BODY_BYTES in src/profiles.rs. The per-field caps alone don't bound the whole
+// document — 100 headers × 10 KiB on each of 50 profiles is ~51 MB — so without this the client
+// could build a perfectly valid-looking document the server refuses outright, and the 4xx rule
+// below would then stop syncing it for good. Enforced at the paths that can actually grow the
+// document (header editor, new profile) with a visible error, and again in normalize() as a
+// last-resort trim for imported or hand-edited storage.
+const MAX_DOC_BYTES = 256 * 1024;
+// Browsers cap the total body of `keepalive` requests at 64 KiB. A bigger document simply can't
+// leave on the closing-tab path; it stays in localStorage and goes up on the next load.
+const MAX_KEEPALIVE_BYTES = 60 * 1024;
+const CLIENT_ID_RE = /^[0-9a-f]{32}$/;
 
-// Load + sanitize the saved profiles (defensive against hand-edited/corrupt storage): keep only
-// well-formed entries, and normalize each field so a missing/garbage value can't break apply.
-function loadProfiles() {
+// localStorage can throw on read outright (blocked storage, hardened privacy settings), not just
+// fail to persist — every access below goes through this.
+function lsGet(key) {
   try {
-    const arr = JSON.parse(localStorage.getItem(PROFILES_KEY) || "[]");
-    if (!Array.isArray(arr)) return [];
-    return arr
-      .filter((p) => p && typeof p.name === "string" && p.name)
-      .slice(0, MAX_PROFILES)
-      .map((p) => ({
-        name: p.name,
-        route: typeof p.route === "string" ? p.route : "direct",
-        engine: typeof p.engine === "string" ? p.engine : DEFAULT_ENGINE,
-        dns: typeof p.dns === "string" ? p.dns : "",
-        headers: Array.isArray(p.headers)
-          ? p.headers
-              .filter((h) => h && typeof h.name === "string" && typeof h.value === "string" && h.name)
-              .slice(0, MAX_HEADERS)
-              .map((h) => ({ name: h.name, value: h.value }))
-          : [],
-      }));
+    return localStorage.getItem(key);
   } catch (_) {
-    return [];
+    return null;
   }
 }
-let profiles = loadProfiles();
 
-const PROFILE_ACTIVE_KEY = "proxy-active-profile";
 const profileSelect = document.getElementById("proxy-profile");
 const profileNewBtn = document.getElementById("profile-new");
-const profileUpdateBtn = document.getElementById("profile-update");
+const profileRenameBtn = document.getElementById("profile-rename");
 const profileDeleteBtn = document.getElementById("profile-delete");
-const profileClearBtn = document.getElementById("profile-clear");
-// "Tạo mới" name modal.
+const profileNote = document.getElementById("profile-note");
+const syncEl = document.getElementById("profile-sync");
+// Name modal, shared by "Tạo mới" and "Đổi tên".
 const profileNameModal = document.getElementById("profile-name-modal");
+const profileNameTitle = document.getElementById("profile-name-title");
+const profileNameSub = document.getElementById("profile-name-sub");
 const profileNameInput = document.getElementById("profile-name-input");
 const profileNameSaveBtn = document.getElementById("profile-name-save");
 const profileNameCancelBtn = document.getElementById("profile-name-cancel");
 const profileNameError = document.getElementById("profile-name-error");
 
-// Transient UI state: the two-step "Xóa hết" confirm and the "Cập nhật" success flash.
-let clearArmed = false;
-let clearTimer = null;
-let updateFeedbackTimer = null;
+// --- Normalization: the client can never hold a document the server would reject ---
 
-function saveProfiles() {
+// Truncate to at most `max` UTF-16 units without splitting a surrogate pair. A lone surrogate
+// survives JSON.stringify as a bare \uD8xx escape, which serde_json rejects — so a naive slice on
+// a name ending in an emoji would produce a document the server 400s forever.
+function clip(s, max) {
+  if (s.length <= max) return s;
+  const code = s.charCodeAt(max - 1);
+  // A high surrogate in the last kept slot has had its partner cut off: drop it too.
+  return s.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
+}
+
+// Same rules the header editor enforces on save (name token, no CR/LF/NUL, byte cap, 100 entries),
+// applied here to whatever the document happens to contain.
+function normalizeProfileHeaders(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const h of list) {
+    if (!h || typeof h.name !== "string" || typeof h.value !== "string") continue;
+    if (!HEADER_NAME_RE.test(h.name)) continue;
+    if (/[\r\n\0]/.test(h.value)) continue;
+    if (byteLen(h.value) > MAX_HEADER_VALUE_BYTES) continue;
+    out.push({ name: h.name, value: h.value });
+    if (out.length >= MAX_HEADERS) break;
+  }
+  return out;
+}
+
+// Runs on EVERY write — every localStorage save and every PUT, not just the migration. The old
+// code enforced its limits on the save paths only, so an old or hand-edited storage could feed an
+// invalid document straight through the load path and then 400 on every push, forever.
+function normalize(doc) {
+  const src = doc && typeof doc === "object" ? doc : {};
+  const entries = [];
+  for (const raw of Array.isArray(src.profiles) ? src.profiles : []) {
+    if (!raw || typeof raw !== "object" || typeof raw.name !== "string") continue;
+    const name = clip(raw.name.trim(), MAX_PROFILE_NAME); // cap the name…
+    if (!name) continue; // …and drop whatever is left of a blank one
+    entries.push({
+      from: raw.name, // pre-normalization name, so `active` can follow a rename below
+      name,
+      route: typeof raw.route === "string" ? clip(raw.route, MAX_PROFILE_FIELD) : "direct",
+      engine:
+        typeof raw.engine === "string" ? clip(raw.engine, MAX_PROFILE_FIELD) : DEFAULT_ENGINE,
+      dns: typeof raw.dns === "string" ? clip(raw.dns, MAX_PROFILE_FIELD) : "",
+      headers: normalizeProfileHeaders(raw.headers),
+    });
+  }
+
+  // `default` always exists and always comes FIRST — that ordering is what makes the collision
+  // rule below rename an imported/legacy "default" rather than the real one.
+  const at = entries.findIndex((p) => p.name.toLowerCase() === DEFAULT_PROFILE);
+  if (at < 0) {
+    entries.unshift({
+      from: DEFAULT_PROFILE,
+      name: DEFAULT_PROFILE,
+      route: "direct",
+      engine: DEFAULT_ENGINE,
+      dns: "",
+      headers: [],
+    });
+  } else {
+    const [d] = entries.splice(at, 1);
+    d.name = DEFAULT_PROFILE; // fold a case variant ("Default") onto the canonical spelling
+    entries.unshift(d);
+  }
+
+  // Case-insensitive collisions resolve in array order: the first occurrence keeps the name, each
+  // later one takes " (2)", " (3)", … — re-truncated so the suffix still fits inside 64 chars.
+  // The counter CHAINS: an entry already called "default (2)" that collides becomes "default (3)",
+  // not "default (2) (2)", so migrating a store that was itself migrated once stays readable.
+  const taken = new Set();
+  for (const p of entries) {
+    if (!taken.has(p.name.toLowerCase())) {
+      taken.add(p.name.toLowerCase());
+      continue;
+    }
+    const base = p.name.replace(/ \(\d+\)$/, "") || p.name;
+    for (let n = 2; ; n++) {
+      const suffix = ` (${n})`;
+      const candidate = clip(base, MAX_PROFILE_NAME - suffix.length) + suffix;
+      if (taken.has(candidate.toLowerCase())) continue;
+      p.name = candidate;
+      taken.add(candidate.toLowerCase());
+      break;
+    }
+  }
+
+  // Over the cap, the tail goes. Legacy entries carry no timestamp, so "oldest" isn't
+  // implementable — array order is the only order there is, and `default` sits at the front.
+  const kept = entries.slice(0, MAX_PROFILES);
+
+  // `active` must name a survivor: follow the rename when there is one, else fall back.
+  let active = typeof src.active === "string" ? src.active : DEFAULT_PROFILE;
+  if (!kept.some((p) => p.name === active)) {
+    const renamed = kept.find((p) => p.from === active);
+    active = renamed ? renamed.name : DEFAULT_PROFILE;
+  }
+
+  const out = {
+    updated: Number.isFinite(src.updated) && src.updated >= 0 ? Math.floor(src.updated) : 0,
+    active,
+    profiles: kept.map((p) => ({
+      name: p.name,
+      route: p.route,
+      engine: p.engine,
+      dns: p.dns,
+      headers: p.headers,
+    })),
+  };
+
+  // Last-resort size guard. The paths that can realistically grow the document (the header editor,
+  // "Tạo mới") refuse with a visible error before it ever gets here — see docFits(). This only
+  // catches storage that arrived already oversized (hand-edited, or written by a future version),
+  // where silently dropping the tail beats a document that can never be synced again. `default`
+  // is never dropped; a profile that alone blows the budget loses its headers rather than the
+  // whole profile, so switching to it still works.
+  while (docBytes(out) > MAX_DOC_BYTES && out.profiles.length > 1) out.profiles.pop();
+  if (docBytes(out) > MAX_DOC_BYTES) out.profiles[0].headers = [];
+  if (!out.profiles.some((p) => p.name === out.active)) out.active = DEFAULT_PROFILE;
+  return out;
+}
+
+const docBytes = (doc) => byteLen(JSON.stringify(doc));
+
+// Would this document still be accepted? Used by the paths that can grow it, so the user gets an
+// explanation instead of a silent trim.
+function docFits(doc) {
+  return docBytes(doc) <= MAX_DOC_BYTES;
+}
+
+// --- Migration: legacy keys → one document, once, on the first load after the upgrade ---
+
+function loadStoredConfig() {
+  const raw = lsGet(CONFIG_KEY);
+  if (!raw) return null;
   try {
-    localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+    const doc = JSON.parse(raw);
+    if (!doc || typeof doc !== "object" || !Array.isArray(doc.profiles)) return null;
+    // One bad clock reading must not pin the document forever: a stamp far in the future would
+    // otherwise beat every server copy on every load, for good.
+    if (typeof doc.updated === "number" && doc.updated > Date.now() + 60000) doc.updated = Date.now();
+    return doc;
   } catch (_) {
-    /* storage blocked/full: keep the in-memory copy for this session */
+    return null;
   }
 }
 
+// The legacy `proxy-profiles` list, filtered to entries worth carrying over. No field sanitizing
+// here — normalize() does that for the whole document a few lines later.
+function loadLegacyProfiles() {
+  try {
+    const arr = JSON.parse(lsGet(LEGACY_PROFILES_KEY) || "[]");
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((p) => p && typeof p === "object" && typeof p.name === "string" && p.name)
+      .slice(0, MAX_PROFILES);
+  } catch (_) {
+    return [];
+  }
+}
+
+// Is there anything of the user's to carry over at all? Decides whether a freshly built document
+// gets to outrank the server's copy (see below).
+function hasLegacyState() {
+  return Boolean(
+    lsGet(ROUTE_KEY) ||
+      lsGet(DNS_KEY) ||
+      lsGet(ENGINE_KEY) ||
+      lsGet(HEADERS_KEY) ||
+      lsGet(LEGACY_PROFILES_KEY)
+  );
+}
+
+function migrateConfig() {
+  const stored = loadStoredConfig();
+  if (stored) return normalize(stored); // a document already exists: use it and stop
+
+  const doc = {
+    // A document invented from an EMPTY storage must lose to anything the server holds — that
+    // recovery ("clear localStorage, get your profiles back") is the whole reason the client ID is
+    // a fingerprint rather than a random UUID. With real settings to carry over there is something
+    // to defend, so the document is stamped now and wins instead.
+    updated: hasLegacyState() ? Date.now() : 0,
+    active: DEFAULT_PROFILE,
+    profiles: [
+      // `default` is exactly what the user is looking at right now, so nothing changes under them.
+      {
+        name: DEFAULT_PROFILE,
+        route: lsGet(ROUTE_KEY) || "direct",
+        engine: lsGet(ENGINE_KEY) || DEFAULT_ENGINE,
+        dns: lsGet(DNS_KEY) || "",
+        headers: headerOverrides.map((h) => ({ name: h.name, value: h.value })),
+      },
+      // Legacy snapshots keep their names. A legacy "default" is kept rather than absorbed —
+      // normalize's collision rule renames it "default (2)", so no config is lost and there is no
+      // special case here.
+      ...loadLegacyProfiles(),
+    ],
+  };
+  const legacyActive = lsGet(LEGACY_ACTIVE_KEY);
+  if (legacyActive && doc.profiles.some((p) => p.name === legacyActive)) doc.active = legacyActive;
+
+  // Normalizing matters most right here: the old loader returned up to 50 entries and the UI let a
+  // user genuinely reach that cap, so `default` + 50 legacy = 51 — one over the server's limit.
+  // Un-normalized, every PUT would 400 forever, breaking sync for exactly the heaviest users.
+  const out = normalize(doc);
+  try {
+    localStorage.setItem(CONFIG_KEY, JSON.stringify(out));
+    localStorage.removeItem(LEGACY_PROFILES_KEY);
+    localStorage.removeItem(LEGACY_ACTIVE_KEY);
+  } catch (_) {
+    /* storage blocked/full: the in-memory document stays authoritative for this session */
+  }
+  return out;
+}
+
+let config = migrateConfig();
+
+function activeProfile() {
+  return config.profiles.find((p) => p.name === config.active) || config.profiles[0];
+}
+
 // The current live settings, as a profile-shaped object.
+//
+// A control that isn't live yet must not speak for the profile. `routePicker` stays hidden until
+// /routes.json resolves — and forever when the server offers only `direct` — and `dnsInput` is
+// empty until /dns.json fills it. Without these fallbacks, changing the search engine inside that
+// window (the engine select is populated synchronously, so it is clickable immediately) would
+// write route:"direct" / dns:"" over whatever the profile had saved, and sync the loss upward.
 function currentConfig() {
+  const p = activeProfile();
   return {
-    route: currentRoute(),
+    route: routePicker.hidden ? p.route : routeSelect.value,
     engine: currentEngine(),
-    dns: (dnsInput.value || "").trim(),
+    dns: dnsSettled ? (dnsInput.value || "").trim() : p.dns,
     headers: headerOverrides.map((h) => ({ name: h.name, value: h.value })),
   };
+}
+
+// The document as it would look with a different header set on the active profile — so a save path
+// can size-check its result before committing to it.
+function withHeaders(headers) {
+  const candidate = JSON.parse(JSON.stringify(config));
+  const p = candidate.profiles.find((x) => x.name === candidate.active) || candidate.profiles[0];
+  p.headers = headers.map((h) => ({ name: h.name, value: h.value }));
+  return candidate;
 }
 
 // Restore a profile's settings into the live controls, then rebuild the transport + reload once
@@ -469,150 +721,322 @@ async function applyProfile(p) {
   }
 }
 
-// Rebuild the dropdown from `profiles`, keeping `selected` if it still exists; a leading
-// placeholder means "no profile selected". Also refreshes the action buttons' enabled state.
-function renderProfileSelect(selected = profileSelect.value) {
+// --- Auto-save: mirror key → active profile → normalize → localStorage → debounced PUT ---
+
+// Fold the live controls into the active profile. Called right after each mirror-key write so the
+// two can't drift; the caller's own transport rebuild + reload (route, DNS, headers) is untouched,
+// which is why auto-save never causes a second reload.
+function autoSave() {
+  Object.assign(activeProfile(), currentConfig());
+  touchConfig();
+}
+
+// The single write path for the document. A localStorage write that throws (quota exceeded,
+// storage blocked) is caught and ignored: the in-memory document stays authoritative for the
+// session and the push still goes out.
+function touchConfig() {
+  config.updated = Date.now();
+  config = normalize(config);
+  try {
+    localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+  } catch (_) {
+    /* keep the in-memory copy for this session */
+  }
+  scheduleSync();
+}
+
+// --- Server sync: one document per browser, last-write-wins on `updated` ---
+
+let syncTimer = null;
+let syncSettled = false; // the status line stays hidden until the first attempt resolves
+let syncBlocked = false; // 4xx: a document the server will never accept — stop pushing it
+let syncSeq = 0; // bumped per scheduled write, so a slow response can't speak for a newer one
+let clientIdValue = null;
+
+function setSyncStatus(state, text, reason) {
+  if (!syncEl) return;
+  syncEl.dataset.state = state;
+  syncEl.textContent = text;
+  if (reason) syncEl.title = reason;
+  else syncEl.removeAttribute("title");
+  syncEl.hidden = !syncSettled;
+}
+
+// Terminal outcomes go through these; the first one is also what reveals the line, so a fresh
+// landing never flashes a warning before the first attempt has even finished.
+function syncSucceeded() {
+  syncSettled = true;
+  setSyncStatus("synced", "Đã đồng bộ");
+}
+function syncFailed(reason) {
+  syncSettled = true;
+  setSyncStatus("local", "Chỉ lưu cục bộ", reason);
+}
+
+function cachedClientId() {
+  const v = lsGet(CLIENT_ID_KEY);
+  return v && CLIENT_ID_RE.test(v) ? v : null;
+}
+
+// clientId() is the global from client-id.js (a classic script loaded just before this one). It
+// caches in localStorage itself, so the cached read here is only a fast path — and the one the
+// keepalive flush depends on, since that path can't await anything.
+async function resolveClientId() {
+  if (clientIdValue) return clientIdValue;
+  clientIdValue = cachedClientId();
+  if (clientIdValue) return clientIdValue;
+  if (typeof clientId !== "function") return null; // client-id.js missing: local-only
+  try {
+    const id = await clientId();
+    clientIdValue = CLIENT_ID_RE.test(id) ? id : null;
+  } catch (_) {
+    clientIdValue = null;
+  }
+  return clientIdValue;
+}
+
+async function readError(res) {
+  try {
+    return (await res.text()).trim().slice(0, 200);
+  } catch (_) {
+    return "";
+  }
+}
+
+// Debouncing collapses a burst of changes (typing a DNS server, flipping through engines) into one
+// PUT. Scheduling also un-blocks a previous 4xx: the document has changed, so it's worth one more
+// attempt — but nothing else ever retries it.
+function scheduleSync() {
+  syncBlocked = false;
+  syncSeq++;
+  setSyncStatus("syncing", "Đang lưu…");
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    pushConfig(false);
+  }, SYNC_DEBOUNCE_MS);
+}
+
+// A pending write must survive the tab closing: `keepalive` lets the request outlive the document.
+function flushSync() {
+  if (syncTimer === null) return;
+  clearTimeout(syncTimer);
+  syncTimer = null;
+  pushConfig(true);
+}
+
+async function pushConfig(keepalive) {
+  if (syncBlocked) return;
+  // Whose write this is. A slow response that lands after the user has changed something else
+  // must not report "Đã đồng bộ" while that newer document is still only in localStorage.
+  const seq = syncSeq;
+  // The keepalive path can't await: the page may already be gone. A browser with no ID computed
+  // yet just pushes on its next change or its next load.
+  const id = keepalive ? clientIdValue || cachedClientId() : await resolveClientId();
+  if (!id) return syncFailed("Chưa xác định được ID trình duyệt");
+  const body = JSON.stringify(config);
+  try {
+    const res = await fetch(`/api/profiles/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body,
+      // Over the browser's keepalive quota the request would just fail; send it normally and let
+      // the closing tab take its chances. The document is in localStorage either way, and the
+      // next load pushes it.
+      keepalive: keepalive && byteLen(body) <= MAX_KEEPALIVE_BYTES,
+    });
+    if (res.ok) {
+      if (seq === syncSeq) syncSucceeded();
+      return;
+    }
+    if (res.status < 500) {
+      // Not transient — a client-side bug. Never re-PUT a document the server will never accept.
+      // Only when this is still the current document: a late 4xx for a superseded one must not
+      // block the newer write that has already been scheduled.
+      if (seq !== syncSeq) return;
+      syncBlocked = true;
+      return syncFailed((await readError(res)) || `HTTP ${res.status}`);
+    }
+    syncFailed(`Máy chủ lỗi (HTTP ${res.status})`);
+  } catch (_) {
+    syncFailed("Không kết nối được máy chủ"); // the next change retries
+  }
+}
+
+// Reconcile with the server once, on load. Clock skew is accepted: `updated` comes from whichever
+// client wrote it, and two browsers sharing one fingerprint are almost certainly one machine.
+async function syncOnLoad() {
+  const id = await resolveClientId();
+  if (!id) return syncFailed("Chưa xác định được ID trình duyệt");
+  let res;
+  try {
+    res = await fetch(`/api/profiles/${id}`, { cache: "no-store" });
+  } catch (_) {
+    return syncFailed("Không kết nối được máy chủ");
+  }
+  if (res.status === 404) return scheduleSync(); // the server has nothing for us yet
+  if (res.status >= 500) return syncFailed(`Máy chủ lỗi (HTTP ${res.status})`);
+  if (!res.ok) {
+    syncBlocked = true;
+    return syncFailed((await readError(res)) || `HTTP ${res.status}`);
+  }
+  let remote;
+  try {
+    remote = normalize(await res.json());
+  } catch (_) {
+    return syncFailed("Máy chủ trả về dữ liệu không đọc được");
+  }
+  if (remote.updated <= config.updated) return scheduleSync(); // ties push local
+
+  // The server's copy is newer: adopt it wholesale. Wait for the route/DNS fetches first —
+  // applyProfile skips a route the select doesn't offer yet, and loadDns() would otherwise
+  // overwrite the input right after we set it. Nothing has navigated, so no transport rebuild.
+  await Promise.all([routesReady, dnsReady]);
+  config = remote;
+  try {
+    localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+  } catch (_) {
+    /* keep the in-memory copy */
+  }
+  renderProfileSelect();
+  try {
+    await applyProfile(activeProfile());
+  } catch (_) {
+    /* blocked storage makes its mirror writes throw; the document is adopted either way */
+  }
+  syncSucceeded();
+}
+
+// The debounce is worthless if a closing tab drops it, and both events are needed: `pagehide`
+// covers navigation away, `visibilitychange` covers mobile task-switching that never fires it.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushSync();
+});
+window.addEventListener("pagehide", flushSync);
+
+// --- The profile control: select / Tạo mới / Đổi tên / Xóa ---
+
+// Rebuild the dropdown from the document. No placeholder option — `default` always exists, so
+// "no profile selected" isn't a state any more.
+function renderProfileSelect() {
   profileSelect.replaceChildren();
-  const ph = document.createElement("option");
-  ph.value = "";
-  ph.textContent = profiles.length ? "— Chọn hồ sơ —" : "— Chưa có hồ sơ —";
-  profileSelect.appendChild(ph);
-  for (const p of profiles) {
+  for (const p of config.profiles) {
     const o = document.createElement("option");
     o.value = p.name;
     o.textContent = p.name;
     profileSelect.appendChild(o);
   }
-  profileSelect.value = profiles.some((p) => p.name === selected) ? selected : "";
+  profileSelect.value = config.active;
   updateProfileButtons();
+  updateProfileNote();
 }
 
-// Cập nhật / Xóa act on the selected profile; "Xóa hết" needs at least one profile to exist.
+// `default` is what everything falls back to, so it can be neither renamed nor deleted.
 function updateProfileButtons() {
-  profileUpdateBtn.disabled = !profileSelect.value;
-  profileDeleteBtn.disabled = !profileSelect.value;
-  profileClearBtn.disabled = !profiles.length;
-  disarmClear(); // a render/selection change cancels any pending "Xóa hết" confirm
+  const isDefault = config.active === DEFAULT_PROFILE;
+  profileRenameBtn.disabled = isDefault;
+  profileDeleteBtn.disabled = isDefault;
 }
 
-// Persist which profile is active so the dropdown restores its selection on reload.
-function setActiveProfile(name) {
-  try {
-    localStorage.setItem(PROFILE_ACTIVE_KEY, name || "");
-  } catch (_) {
-    /* ignore */
-  }
-  profileSelect.value = name || "";
-  updateProfileButtons();
+// Spells out the ownership the indentation only hints at.
+function updateProfileNote() {
+  if (!profileNote) return;
+  profileNote.textContent = `Các thiết lập trên thuộc hồ sơ "${config.active}" — tự động lưu.`;
 }
 
-// Picking a profile from the dropdown applies it and marks it active; the placeholder clears it.
+// Picking a profile applies its whole configuration at once.
 profileSelect.addEventListener("change", () => {
-  const name = profileSelect.value;
-  if (!name) {
-    setActiveProfile("");
-    return;
-  }
-  const p = profiles.find((x) => x.name === name);
-  if (p) {
-    setActiveProfile(name);
-    applyProfile(p);
-  } else {
-    updateProfileButtons();
-  }
+  const picked = config.profiles.find((p) => p.name === profileSelect.value);
+  if (!picked) return renderProfileSelect(); // a stale option: repaint from the document
+  config.active = picked.name;
+  touchConfig();
+  updateProfileButtons();
+  updateProfileNote();
+  applyProfile(activeProfile()); // re-read: touchConfig normalizes into fresh objects
 });
 
-// --- Tạo mới: enter a name in a small modal, then save the current config as a new profile ---
+// --- The name modal, shared by "Tạo mới" and "Đổi tên" ---
+
+let nameModalMode = "create";
+
 function showNameError(msg) {
   profileNameError.textContent = msg || "";
   profileNameError.hidden = !msg;
 }
-function openNameModal() {
+function openNameModal(mode) {
+  nameModalMode = mode;
   closeSettings(); // don't leave the popover open behind the modal
   showNameError("");
-  profileNameInput.value = "";
+  const renaming = mode === "rename";
+  profileNameTitle.textContent = renaming ? "Đổi tên hồ sơ" : "Tạo hồ sơ mới";
+  profileNameSub.textContent = renaming
+    ? `Đặt tên mới cho hồ sơ "${config.active}". Cấu hình của hồ sơ giữ nguyên.`
+    : "Lưu toàn bộ cấu hình hiện tại (Route, DNS, Search và các header ghi đè) thành một hồ sơ.";
+  profileNameInput.value = renaming ? config.active : "";
   profileNameModal.hidden = false;
   profileNameInput.focus();
+  profileNameInput.select();
 }
 function closeNameModal() {
   profileNameModal.hidden = true;
 }
-function createProfile() {
+
+// Create copies the CURRENT config into a new profile (and switches to it); rename only relabels
+// the active one. Both share the same name rules, which are the server's rules.
+function submitNameModal() {
   const name = (profileNameInput.value || "").trim();
   if (!name) return showNameError("Nhập tên hồ sơ.");
   if (name.length > MAX_PROFILE_NAME) return showNameError(`Tên tối đa ${MAX_PROFILE_NAME} ký tự.`);
-  if (profiles.some((p) => p.name.toLowerCase() === name.toLowerCase()))
-    return showNameError("Tên hồ sơ đã tồn tại.");
-  if (profiles.length >= MAX_PROFILES) return showNameError(`Tối đa ${MAX_PROFILES} hồ sơ.`);
-  profiles.push({ name, ...currentConfig() });
-  saveProfiles();
-  closeNameModal();
-  renderProfileSelect(name);
-  setActiveProfile(name);
-}
+  const taken = (p) => p.name.toLowerCase() === name.toLowerCase();
 
-// --- Cập nhật: overwrite the selected profile with the current config ---
-function updateSelectedProfile() {
-  const name = profileSelect.value;
-  const at = profiles.findIndex((p) => p.name === name);
-  if (at < 0) return;
-  profiles[at] = { name, ...currentConfig() };
-  saveProfiles();
-  profileUpdateBtn.textContent = "Đã lưu ✓"; // brief inline confirmation
-  clearTimeout(updateFeedbackTimer);
-  updateFeedbackTimer = setTimeout(() => (profileUpdateBtn.textContent = "Cập nhật"), 1500);
-}
-
-// --- Xóa: remove the selected profile ---
-function deleteSelectedProfile() {
-  const name = profileSelect.value;
-  if (!name) return;
-  profiles = profiles.filter((p) => p.name !== name);
-  saveProfiles();
-  setActiveProfile("");
-  renderProfileSelect("");
-}
-
-// --- Xóa hết: two-step confirm on the button itself (no native dialog) ---
-function disarmClear() {
-  if (!clearArmed) return;
-  clearArmed = false;
-  clearTimeout(clearTimer);
-  profileClearBtn.textContent = "Xóa hết";
-  profileClearBtn.classList.remove("armed");
-}
-function onClearClick() {
-  if (!profiles.length) return;
-  if (!clearArmed) {
-    clearArmed = true;
-    profileClearBtn.textContent = "Chắc chắn?";
-    profileClearBtn.classList.add("armed");
-    clearTimer = setTimeout(disarmClear, 3000);
-    return;
+  if (nameModalMode === "rename") {
+    const current = activeProfile();
+    if (!current || current.name === DEFAULT_PROFILE) return closeNameModal();
+    if (config.profiles.some((p) => p !== current && taken(p)))
+      return showNameError("Tên hồ sơ đã tồn tại.");
+    current.name = name;
+  } else {
+    if (config.profiles.some(taken)) return showNameError("Tên hồ sơ đã tồn tại.");
+    if (config.profiles.length >= MAX_PROFILES) return showNameError(`Tối đa ${MAX_PROFILES} hồ sơ.`);
+    const added = { name, ...currentConfig() };
+    // Copying a header-heavy profile is the other way the document can outgrow what the server
+    // accepts; say so instead of letting normalize() drop it back off again.
+    if (!docFits({ ...config, profiles: [...config.profiles, added] }))
+      return showNameError(`Cấu hình vượt quá ${Math.floor(MAX_DOC_BYTES / 1024)} KB.`);
+    config.profiles.push(added);
   }
-  disarmClear();
-  profiles = [];
-  saveProfiles();
-  setActiveProfile("");
-  renderProfileSelect("");
+  config.active = name;
+  closeNameModal();
+  touchConfig();
+  renderProfileSelect();
 }
 
-profileNewBtn.addEventListener("click", openNameModal);
-profileUpdateBtn.addEventListener("click", updateSelectedProfile);
-profileDeleteBtn.addEventListener("click", deleteSelectedProfile);
-profileClearBtn.addEventListener("click", onClearClick);
-profileNameSaveBtn.addEventListener("click", createProfile);
+// Xóa: the active profile goes and `default` takes over, applied like any other switch.
+function deleteActiveProfile() {
+  if (config.active === DEFAULT_PROFILE) return;
+  config.profiles = config.profiles.filter((p) => p.name !== config.active);
+  config.active = DEFAULT_PROFILE;
+  touchConfig();
+  renderProfileSelect();
+  applyProfile(activeProfile());
+}
+
+profileNewBtn.addEventListener("click", () => openNameModal("create"));
+profileRenameBtn.addEventListener("click", () => openNameModal("rename"));
+profileDeleteBtn.addEventListener("click", deleteActiveProfile);
+profileNameSaveBtn.addEventListener("click", submitNameModal);
 profileNameCancelBtn.addEventListener("click", closeNameModal);
 profileNameInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
     e.preventDefault();
-    createProfile();
+    submitNameModal();
   }
 });
 
-// Initial render, restoring the previously-active selection (without re-applying — the individual
-// settings are already persisted, so the live config already matches).
-renderProfileSelect(localStorage.getItem(PROFILE_ACTIVE_KEY) || "");
+// Initial paint (no apply: the mirror keys already drive the controls, so the live config matches),
+// then reconcile with the server.
+renderProfileSelect();
+syncOnLoad();
 
 // Wire the autocomplete dropdown now that the input/form/container all exist.
 autocomplete = initAutocomplete({ input: address, form, container: acContainer });
@@ -782,15 +1206,14 @@ function showConfigFlash() {
   const route = !routePicker.hidden ? routeSelect.value : "direct";
   const dns = (dnsInput.value || "").trim() || dnsDefault;
   const rows = [
+    // The profile owns every row below it — and one is always active now, so it always shows.
+    flashRow("Hồ sơ", config.active),
     flashRow("Route", route),
     flashRow("Search", engineLabel(currentEngine())),
     flashRow("DNS", dns),
   ];
   if (headerOverrides.length) {
     rows.push(flashRow("Headers", `${headerOverrides.length} ghi đè`));
-  }
-  if (profileSelect && profileSelect.value) {
-    rows.push(flashRow("Profile", profileSelect.value));
   }
   // Surface the insecure-TLS state too, when the current site is on the unverified path.
   const host = currentTargetHost();
@@ -936,7 +1359,7 @@ function onHotkey(e) {
     closeHeadersEditor();
     return;
   }
-  // Likewise the "Tạo mới" profile name modal.
+  // Likewise the profile name modal ("Tạo mới" / "Đổi tên").
   if (profileNameModal && !profileNameModal.hidden) {
     e.preventDefault();
     closeNameModal();

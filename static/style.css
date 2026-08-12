@@ -5,6 +5,7 @@
   --muted: #9aa0a6;
   --accent: #6c8cff;
   --error: #ff6b6b;
+  --warn: #ffb454; /* degraded-but-working, e.g. saved locally with no server sync */
   --field: #1b1f27;
   --border: #2a2f3a;
 }
@@ -690,10 +691,71 @@ button:disabled {
   filter: none;
 }
 
-/* --- Profiles: dropdown + inline action buttons, plus the "Tạo mới" name modal --- */
+/* --- Profiles: the profile row, the settings nested under it, and the name modal --- */
 
-/* The Profile row's control cluster (dropdown + Tạo mới / Cập nhật / Xóa / Xóa hết). Wraps
-   gracefully when the row is narrow. */
+/* The profile row + its sync line, closed off by a rule: everything under that rule belongs to
+   the selected profile. */
+.profile-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* The four settings, drawn as the profile's contents: a left rule plus a real left margin (not
+   just padding — the indent has to move the box, not only its text) says "these belong to that
+   profile" without repeating the profile name on every row. */
+.profile-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  margin-left: 0.4rem;
+  padding-left: 0.85rem;
+  border-left: 2px solid var(--border);
+}
+
+/* Match the tighter rhythm the popover gives the rest of the panel. */
+#settings-popover .profile-scope {
+  gap: 0.6rem;
+}
+
+/* One-line sync state with a coloured dot; a failure puts its reason in `title`. Right-aligned so
+   it sits under the controls it describes (the row justifies its cluster to the right). */
+.profile-sync {
+  font-size: 0.8rem;
+  text-align: right;
+  color: var(--muted);
+}
+
+.profile-sync[hidden] {
+  display: none;
+}
+
+.profile-sync::before {
+  content: "●";
+  margin-right: 0.35rem;
+}
+
+.profile-sync[data-state="synced"] {
+  color: var(--accent);
+}
+
+.profile-sync[data-state="local"] {
+  color: var(--warn);
+}
+
+/* "Các thiết lập trên thuộc hồ sơ … — tự động lưu." — aligned with the nested settings, since it
+   explains them. A <div>, not a <p>: `#landing p` would out-specify these rules on the landing. */
+.profile-note {
+  padding-left: calc(0.4rem + 0.85rem + 2px);
+  font-size: 0.8rem;
+  text-align: left;
+  color: var(--muted);
+}
+
+/* The profile row's control cluster (dropdown + Tạo mới / Đổi tên / Xóa). Wraps gracefully when
+   the row is narrow. */
 .profile-controls {
   display: flex;
   flex-wrap: wrap;
@@ -723,14 +785,7 @@ button:disabled {
   border-color: var(--error);
 }
 
-/* "Xóa hết" armed for its second (confirming) click. */
-.profile-btn.armed {
-  color: var(--error);
-  border-color: var(--error);
-  background: #2a1512;
-}
-
-/* Name input inside the "Tạo mới" modal. */
+/* Name input inside the "Tạo mới" / "Đổi tên" modal. */
 .profile-name-input {
   width: 100%;
   padding: 0.5rem 0.7rem;

@@ -47,6 +47,20 @@ pub struct Config {
     /// `cert` and `key` paths it uses those PEM files; with neither it generates a self-signed
     /// cert at startup (localhost/dev only).
     pub tls: Option<TlsSettings>,
+    /// Where per-browser configuration documents are kept (`/api/profiles/:id`). Always present:
+    /// the store is unconditional, only its location and size are configurable.
+    pub storage: Storage,
+}
+
+/// The profile document store's disk settings. Not an `Option` like `tls` — profile sync is always
+/// on, so there is no "off" state to represent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Storage {
+    /// Directory holding one `<client-id>.json` per browser. Created on the first write.
+    pub dir: String,
+    /// Cap on stored documents; a new one past the cap evicts the least-recently-written. Bounds
+    /// disk use by an unauthenticated endpoint — each document is at most 256 KiB.
+    pub max_clients: usize,
 }
 
 /// Enabled-TLS settings. Absence of a value (`Config::tls == None`) means TLS is off.
@@ -89,6 +103,10 @@ impl Default for Config {
             },
             default_dns: DEFAULT_DNS.to_string(),
             tls: None,
+            storage: Storage {
+                dir: "./data/profiles".to_string(),
+                max_clients: 5000,
+            },
         }
     }
 }
@@ -109,6 +127,8 @@ impl Config {
     /// - `TLS`: `1`/`true` to serve HTTPS (default off = HTTP).
     /// - `TLS_CERT` / `TLS_KEY`: PEM cert + key paths; set both, or neither to auto-generate.
     /// - `TLS_HOSTNAMES`: comma-separated extra SAN hosts for the auto-generated cert.
+    /// - `PROFILES_DIR`: directory for the per-browser profile documents (default
+    ///   `./data/profiles`); overrides the file's `storage.dir`.
     /// - `CONFIG`: path to a YAML config (default `config.yaml` if present). See
     ///   `config.example.yaml`. Holds the `bind` address (`interface` + `port`) and the
     ///   `routes` list. `BIND`/`PORT` env vars override the file's `bind`. A malformed config
@@ -141,6 +161,9 @@ impl Config {
             cfg.dns = dns;
             cfg.default_dns = default_dns;
             cfg.tls = parse_tls(body).map_err(|e| format!("{path}: {e}"))?;
+            if let Some(storage) = parse_storage(body).map_err(|e| format!("{path}: {e}"))? {
+                cfg.storage = storage;
+            }
         } else {
             // No config file: still expose the built-in DoH presets alongside `system`.
             cfg.dns = dns::build_defaults()?;
@@ -226,6 +249,9 @@ impl Config {
         if let Some(tls) = &cfg.tls {
             validate_tls(tls)?;
         }
+        if let Ok(dir) = std::env::var("PROFILES_DIR") {
+            cfg.storage.dir = dir;
+        }
         Ok(cfg)
     }
 
@@ -306,6 +332,37 @@ fn parse_tls(yaml: &str) -> Result<Option<TlsSettings>, String> {
     };
     validate_tls(&settings)?;
     Ok(Some(settings))
+}
+
+/// The optional `storage:` section of the config file.
+#[derive(serde::Deserialize)]
+struct StorageFile {
+    storage: Option<StorageSpec>,
+}
+#[derive(serde::Deserialize)]
+struct StorageSpec {
+    /// Directory for the profile documents. Defaults to `./data/profiles`.
+    dir: Option<String>,
+    /// Cap on stored documents. Defaults to 5000.
+    max_clients: Option<usize>,
+}
+
+/// Parse the `storage` section. Like `bind`, each field falls back to the default independently,
+/// so a file that sets only `max_clients` keeps the default directory.
+fn parse_storage(yaml: &str) -> Result<Option<Storage>, String> {
+    let f: StorageFile =
+        serde_yaml_ng::from_str(yaml).map_err(|e| format!("config parse error: {e}"))?;
+    let Some(spec) = f.storage else {
+        return Ok(None);
+    };
+    let mut storage = Config::default().storage;
+    if let Some(dir) = spec.dir {
+        storage.dir = dir;
+    }
+    if let Some(max) = spec.max_clients {
+        storage.max_clients = max;
+    }
+    Ok(Some(storage))
 }
 
 /// Validate that `cert` and `key` are set together (both, so custom PEM files are used) or
@@ -474,6 +531,26 @@ mod tests {
     fn tls_enabled_with_only_one_path_is_fatal() {
         assert!(parse_tls("tls:\n  enabled: true\n  cert: \"c.pem\"\n").is_err());
         assert!(parse_tls("tls:\n  enabled: true\n  key: \"k.pem\"\n").is_err());
+    }
+
+    #[test]
+    fn storage_absent_keeps_defaults() {
+        assert_eq!(parse_storage("routes: []").unwrap(), None);
+        let d = Config::default().storage;
+        assert_eq!(d.dir, "./data/profiles");
+        assert_eq!(d.max_clients, 5000);
+    }
+
+    #[test]
+    fn storage_fields_override_independently() {
+        let dir_only = parse_storage("storage:\n  dir: \"/srv/profiles\"\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dir_only.dir, "/srv/profiles");
+        assert_eq!(dir_only.max_clients, 5000);
+        let max_only = parse_storage("storage:\n  max_clients: 10\n").unwrap().unwrap();
+        assert_eq!(max_only.dir, "./data/profiles");
+        assert_eq!(max_only.max_clients, 10);
     }
 
     #[test]

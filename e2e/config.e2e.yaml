@@ -1,0 +1,11 @@
+# Config used only by the Playwright suite. Deliberately minimal: no route here ever dials
+# anything, so the server starts instantly (unlike the real config.yaml, whose `warp` and `tor`
+# routes register with Cloudflare / bootstrap arti at first use).
+#
+# One dummy HTTP-CONNECT route exists purely so `/routes.json` returns more than `direct` — the
+# Route picker hides itself when `direct` is the only option, and the tests need it visible to
+# prove Route is part of a profile. Nothing ever connects through it.
+routes:
+  - name: fake
+    type: http
+    address: "127.0.0.1:9"

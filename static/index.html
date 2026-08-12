@@ -15,6 +15,9 @@
     <script src="/search.js" defer></script>
     <script src="/search-engines.js" defer></script>
     <script src="/autocomplete.js" defer></script>
+    <!-- Defines the global clientId(); index.js needs it for the per-browser profile sync, and
+         `defer` keeps that order (both are classic scripts, executed in document order). -->
+    <script src="/client-id.js" defer></script>
     <script src="/index.js" defer></script>
   </head>
   <body>
@@ -55,48 +58,60 @@
     <section id="landing">
       <h1>Browser Proxy</h1>
       <p>Type any URL above and browse it through this server.</p>
+      <!-- The whole panel is reparented into the ⚙ popover on the first navigation
+           (movePickersToPopover), so this markup has to read correctly in both places. -->
       <div class="pickers">
-        <label id="engine-picker">
-          Search:
-          <select id="proxy-engine-landing" aria-label="Search engine"></select>
-        </label>
-        <label id="dns-picker">
-          DNS:
-          <input
-            id="proxy-dns-landing"
-            list="dns-presets"
-            aria-label="DNS server (preset name or IP)"
-            placeholder="system or e.g. 1.1.1.1"
-            spellcheck="false"
-            autocomplete="off"
-          />
-          <datalist id="dns-presets"></datalist>
-        </label>
-        <label id="route-picker" hidden>
-          Route:
-          <select id="proxy-route-landing" aria-label="Route"></select>
-        </label>
-        <label id="headers-picker">
-          Headers:
-          <button
-            id="headers-edit"
-            type="button"
-            class="picker-btn"
-            aria-label="Chỉnh sửa header ghi đè"
-          >
-            Chỉnh sửa<span id="headers-count" class="headers-count"></span>
-          </button>
-        </label>
-        <div id="profiles-picker" class="picker-row">
-          <span class="picker-label">Profile:</span>
-          <span class="profile-controls">
-            <select id="proxy-profile" aria-label="Chọn hồ sơ cấu hình"></select>
-            <button id="profile-new" type="button" class="profile-btn">Tạo mới</button>
-            <button id="profile-update" type="button" class="profile-btn">Cập nhật</button>
-            <button id="profile-delete" type="button" class="profile-btn danger">Xóa</button>
-            <button id="profile-clear" type="button" class="profile-btn danger">Xóa hết</button>
-          </span>
+        <!-- The profile owns everything below it, so it sits on top; the four settings are its
+             contents, not its siblings. -->
+        <div class="profile-head">
+          <div id="profiles-picker" class="picker-row">
+            <span class="picker-label">Hồ sơ:</span>
+            <span class="profile-controls">
+              <select id="proxy-profile" aria-label="Chọn hồ sơ cấu hình"></select>
+              <button id="profile-new" type="button" class="profile-btn">Tạo mới</button>
+              <button id="profile-rename" type="button" class="profile-btn">Đổi tên</button>
+              <button id="profile-delete" type="button" class="profile-btn danger">Xóa</button>
+            </span>
+          </div>
+          <!-- Sync state (● Đã đồng bộ / ● Đang lưu… / ● Chỉ lưu cục bộ). Hidden until the first
+               attempt resolves so a freshly-opened landing never flashes a warning. -->
+          <div id="profile-sync" class="profile-sync" data-state="syncing" hidden></div>
         </div>
+
+        <div class="profile-scope">
+          <label id="engine-picker">
+            Search:
+            <select id="proxy-engine-landing" aria-label="Search engine"></select>
+          </label>
+          <label id="dns-picker">
+            DNS:
+            <input
+              id="proxy-dns-landing"
+              list="dns-presets"
+              aria-label="DNS server (preset name or IP)"
+              placeholder="system or e.g. 1.1.1.1"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <datalist id="dns-presets"></datalist>
+          </label>
+          <label id="route-picker" hidden>
+            Route:
+            <select id="proxy-route-landing" aria-label="Route"></select>
+          </label>
+          <label id="headers-picker">
+            Headers:
+            <button
+              id="headers-edit"
+              type="button"
+              class="picker-btn"
+              aria-label="Chỉnh sửa header ghi đè"
+            >
+              Chỉnh sửa<span id="headers-count" class="headers-count"></span>
+            </button>
+          </label>
+        </div>
+        <div id="profile-note" class="profile-note"></div>
       </div>
       <p id="proxy-error" class="error"></p>
       <pre id="proxy-error-code" class="error-code"></pre>
@@ -162,8 +177,8 @@
       </div>
     </div>
 
-    <!-- "Tạo mới" profile: a small name prompt. Saving snapshots the whole current config
-         (Route + DNS + Search + header overrides) into a named profile in localStorage. -->
+    <!-- Name prompt shared by "Tạo mới" and "Đổi tên" — the two only differ in the title, the
+         blurb and what index.js does with the name, so one dialog serves both. -->
     <div id="profile-name-modal" class="headers-modal" hidden>
       <div
         class="headers-dialog"
@@ -172,7 +187,7 @@
         aria-labelledby="profile-name-title"
       >
         <h2 id="profile-name-title">Tạo hồ sơ mới</h2>
-        <p class="headers-sub">
+        <p id="profile-name-sub" class="headers-sub">
           Lưu toàn bộ cấu hình hiện tại (Route, DNS, Search và các header ghi đè) thành một hồ sơ.
         </p>
         <input
