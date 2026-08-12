@@ -110,8 +110,10 @@ input:focus {
   display: none;
 }
 
+/* Deliberately NOT `.pickers input`: the header rows live inside .pickers now, and a blanket rule
+   would force their name/value fields to the fixed width these single controls want. */
 .pickers select,
-.pickers input {
+.pickers .dns-controls input {
   padding: 0.5rem 0.75rem;
   font-size: 1rem;
   color: var(--fg);
@@ -122,24 +124,34 @@ input:focus {
 }
 
 .pickers select:focus,
-.pickers input:focus {
+.pickers .dns-controls input:focus {
   border-color: var(--accent);
   outline: none;
 }
 
-/* The DNS combobox is a free-text field (preset name or IP); give it room and a text cursor. */
-.pickers input {
-  width: 12rem;
+/* DNS is a dropdown plus an IP field that only appears for "Tùy chỉnh…". */
+.dns-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.dns-controls input {
+  width: 9rem;
   cursor: text;
 }
 
+.dns-controls input[hidden] {
+  display: none;
+}
+
 /* A typed value that's neither a known preset nor a valid IP. */
-.pickers input.invalid {
+.dns-controls input.invalid {
   border-color: var(--error);
 }
 
-/* The Headers picker is a button that opens the editor modal; style it like the field controls
-   (overriding the accent-colored base `button`) so it sits flush with the selects/inputs. */
+/* Buttons styled like the field controls (overriding the accent-colored base `button`) so they sit
+   flush with the selects/inputs. */
 .pickers .picker-btn {
   padding: 0.5rem 0.75rem;
   font-size: 1rem;
@@ -554,7 +566,46 @@ body.browsing #frame-host {
   background: var(--error);
 }
 
-/* --- Header-override editor modal --- */
+/* --- Header overrides, edited inline inside the profile's settings --- */
+
+/* A block rather than a `label` row: the rows stack under their own heading, so it can't use the
+   one-line "label left / control right" layout the other pickers share. */
+.headers-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  font-size: 0.95rem;
+  color: var(--muted, #9aa4b2);
+}
+
+.headers-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+/* The "+ Thêm header" button sits where the other pickers put their control. */
+.headers-block .picker-btn {
+  padding: 0.35rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.headers-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  opacity: 0.85;
+}
+
+/* Nothing configured yet: the hint alone would look like an error, so keep the empty list quiet. */
+.headers-rows:empty {
+  display: none;
+}
+
+/* --- The profile-name dialog, plus the row/error styles it shares with the inline editor ---
+   (`.headers-modal` / `.headers-dialog` keep their names from when the header editor was a modal;
+   the name prompt is the only dialog left using them.) */
 
 .headers-modal {
   position: fixed;
@@ -596,11 +647,13 @@ body.browsing #frame-host {
   font-size: 0.85rem;
 }
 
-/* The scrollable list of header rows (grows with content, capped by the dialog's max-height). */
+/* The list of header rows. Capped in height so a profile with many overrides scrolls instead of
+   pushing the rest of the panel (and the ⚙ popover) off-screen. */
 .headers-rows {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  max-height: 40vh;
   overflow-y: auto;
   padding-right: 0.2rem;
 }
@@ -657,25 +710,13 @@ body.browsing #frame-host {
 }
 
 .headers-error {
-  margin: 0.7rem 0 0;
+  margin: 0;
   color: var(--error);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
 }
 
 .headers-error[hidden] {
   display: none;
-}
-
-.headers-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-top: 0.8rem;
-}
-
-.headers-counter {
-  color: var(--muted);
-  font-size: 0.8rem;
 }
 
 .headers-actions {

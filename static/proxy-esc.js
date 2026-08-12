@@ -47,6 +47,9 @@
   // Config loaded from the server (same endpoints the app shell uses).
   var routes = ["direct"];
   var dnsDefault = "system";
+  var dnsNames = ["system"]; // resolver names from /dns.json, for the preset-vs-custom decision
+  // Sentinel value of the "Tùy chỉnh…" option — matches DNS_CUSTOM in index.js.
+  var DNS_CUSTOM = "__custom__";
 
   function ls(key) {
     try {
@@ -298,17 +301,18 @@
   routeSel.style.cssText = ctlStyle;
   routeLabel.appendChild(routeSel);
 
-  // DNS (editable combobox: a preset name or a typed IP).
+  // DNS: a dropdown of the server's resolvers, mirroring the app shell. The last entry
+  // ("Tùy chỉnh…") is the only one that reveals the free-text field for a typed server IP.
   var dnsLabel = labeled("DNS:");
-  var dnsInput = document.createElement("input");
-  dnsInput.setAttribute("list", "__bp_dns_presets");
-  dnsInput.setAttribute("spellcheck", "false");
-  dnsInput.placeholder = "system or e.g. 1.1.1.1";
-  dnsInput.style.cssText = ctlStyle + "min-width:180px;";
-  var dnsPresets = document.createElement("datalist");
-  dnsPresets.id = "__bp_dns_presets";
-  dnsLabel.appendChild(dnsInput);
-  dnsLabel.appendChild(dnsPresets);
+  var dnsSel = document.createElement("select");
+  dnsSel.style.cssText = ctlStyle;
+  var dnsCustom = document.createElement("input");
+  dnsCustom.setAttribute("spellcheck", "false");
+  dnsCustom.placeholder = "VD: 1.1.1.1";
+  dnsCustom.style.cssText = ctlStyle + "min-width:140px;margin-left:6px;";
+  dnsCustom.hidden = true;
+  dnsLabel.appendChild(dnsSel);
+  dnsLabel.appendChild(dnsCustom);
 
   // Search engine.
   var engLabel = labeled("Search:");
@@ -416,23 +420,63 @@
     })
     .catch(function () {});
 
+  // Build the options from whatever /dns.json gave us — including nothing. A failed fetch used to
+  // leave a plain text field that still worked; an empty <select> would leave no way to set DNS at
+  // all from a proxied page, so the fallback list has to go in on the error path too.
+  function fillDns(raw) {
+    var list = Array.isArray(raw) && raw.length ? raw : [{ name: "system" }];
+    dnsNames = [];
+    dnsSel.replaceChildren();
+    for (var k = 0; k < list.length; k++) {
+      var entry = typeof list[k] === "string" ? { name: list[k] } : list[k];
+      if (!entry || typeof entry.name !== "string" || !entry.name) continue;
+      dnsNames.push(entry.name);
+      var op = document.createElement("option");
+      op.value = entry.name;
+      var ip = Array.isArray(entry.addresses) ? entry.addresses[0] : null;
+      op.textContent = ip ? entry.name + " (" + ip + ")" : entry.name;
+      dnsSel.appendChild(op);
+    }
+    var custom = document.createElement("option");
+    custom.value = DNS_CUSTOM;
+    custom.textContent = "Tùy chỉnh…";
+    dnsSel.appendChild(custom);
+    setDnsControl(ls(DNS_KEY) || "");
+  }
+
   fetch("/dns.json")
     .then(function (r) {
-      return r.json();
+      return r.ok ? r.json() : null; // a 5xx body would otherwise reject in r.json()
+    })
+    .catch(function () {
+      return null;
     })
     .then(function (j) {
-      var list = j && Array.isArray(j.dns) && j.dns.length ? j.dns : ["system"];
       if (j && typeof j.default === "string") dnsDefault = j.default;
-      dnsPresets.replaceChildren();
-      for (var k = 0; k < list.length; k++) {
-        var op = document.createElement("option");
-        op.value = list[k];
-        dnsPresets.appendChild(op);
-      }
-      var saved = ls(DNS_KEY);
-      dnsInput.value = saved != null && saved !== "" ? saved : dnsDefault;
-    })
-    .catch(function () {});
+      fillDns(j && Array.isArray(j.dns) ? j.dns : null);
+    });
+
+  // Mirrors setDnsControl in index.js: a known preset selects its option, anything else falls to
+  // the custom entry with the value in the field, so a resolver the operator removed stays visible.
+  function setDnsControl(value) {
+    var v = (value || "").trim();
+    if (!v) {
+      dnsSel.value = dnsNames.indexOf(dnsDefault) >= 0 ? dnsDefault : dnsNames[0] || "";
+      dnsCustom.value = "";
+    } else if (dnsNames.indexOf(v) >= 0) {
+      dnsSel.value = v;
+      dnsCustom.value = "";
+    } else {
+      dnsSel.value = DNS_CUSTOM;
+      dnsCustom.value = v;
+    }
+    dnsCustom.hidden = dnsSel.value !== DNS_CUSTOM;
+  }
+
+  function dnsValue() {
+    if (dnsSel.value === DNS_CUSTOM) return (dnsCustom.value || "").trim();
+    return dnsSel.value || "";
+  }
 
   // --- Wiring ---
 
@@ -441,12 +485,21 @@
     patchConfig("route", routeSel.value);
     applyTransportAndReload();
   });
-  dnsInput.addEventListener("change", function () {
-    var dns = (dnsInput.value || "").trim();
+  function onDnsChange() {
+    dnsCustom.hidden = dnsSel.value !== DNS_CUSTOM;
+    // Picking "Tùy chỉnh…" only reveals the field; there is nothing to apply until it has a value,
+    // and applying "" would silently drop the resolver out from under the page being viewed.
+    if (dnsSel.value === DNS_CUSTOM && !(dnsCustom.value || "").trim()) {
+      dnsCustom.focus();
+      return;
+    }
+    var dns = dnsValue();
     setLs(DNS_KEY, dns);
     patchConfig("dns", dns);
     applyTransportAndReload();
-  });
+  }
+  dnsSel.addEventListener("change", onDnsChange);
+  dnsCustom.addEventListener("change", onDnsChange);
   engSel.addEventListener("change", function () {
     setLs(ENGINE_KEY, engSel.value); // pure client-side: only the URL box's search uses it
     patchConfig("engine", engSel.value);

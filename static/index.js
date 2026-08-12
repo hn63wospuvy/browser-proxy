@@ -16,17 +16,26 @@ const ROUTE_KEY = "proxy-route";
 const engineSelect = document.getElementById("proxy-engine-landing");
 const ENGINE_KEY = "proxy-engine";
 
-// DNS control: an editable combobox — pick a preset name OR type a DNS server IP. Affects the
-// `direct` route only (VPN/proxy routes resolve at their exit and keep their own DNS). Empty or
-// the server default means "no interference" — no DNS segment is sent.
-const dnsInput = document.getElementById("proxy-dns-landing");
-const dnsPresets = document.getElementById("dns-presets"); // <datalist> of preset names
+// DNS control: a plain dropdown of the resolvers the server offers, each labelled with its real
+// addresses, plus a final "Tùy chỉnh…" entry that reveals a free-text field for a server IP.
+// Affects the `direct` route only (VPN/proxy routes resolve at their exit and keep their own DNS).
+// Empty or the server default means "no interference" — no DNS segment is sent.
+const dnsSelect = document.getElementById("proxy-dns-landing");
+const dnsCustom = document.getElementById("proxy-dns-custom");
 const DNS_KEY = "proxy-dns";
+// The sentinel `value` of the custom option. Not a legal resolver name (the server's names come
+// from YAML keys) and not an IP, so it can never collide with a real selection.
+const DNS_CUSTOM = "__custom__";
 let dnsDefault = "system"; // server's default resolver name (from /dns.json)
 let dnsPresetNames = ["system"]; // preset names from /dns.json (for validation)
-// Whether /dns.json has come back and filled the input. Until it has, the empty field says nothing
-// about the user's choice, so auto-save must not read it (see currentConfig).
+// Whether /dns.json has come back and filled the control. Until it has, the empty select says
+// nothing about the user's choice, so auto-save must not read it (see currentConfig).
 let dnsSettled = false;
+// The last value actually committed. Selecting "Tùy chỉnh…" reveals an empty field, and that
+// half-finished state must not read as "no resolver": every other reader (auto-save, the transport
+// URL, the Esc flash) would otherwise silently fall back to the server default on the next
+// unrelated interaction — see dnsValue().
+let dnsCommitted = "";
 
 // Autocomplete dropdown container + the dim Esc config flash panel.
 const acContainer = document.getElementById("ac-list");
@@ -128,7 +137,7 @@ function currentEngine() {
   });
 })();
 
-// --- DNS: editable combobox — a preset name or a typed DNS-server IP. Only affects `direct`. ---
+// --- DNS: a dropdown of the server's resolvers, plus "Tùy chỉnh…" for a typed IP ---
 
 // A loose IPv4/IPv6 literal check for UI feedback; the server validates strictly.
 function isIpLiteral(s) {
@@ -140,20 +149,64 @@ function dnsIsValid(v) {
   return !v || dnsPresetNames.includes(v) || isIpLiteral(v);
 }
 
+// The stored value: a preset name, a typed IP, or "" for the server default. Unchanged from when
+// this was one text field — the dropdown is a different way to pick, not a different vocabulary,
+// so profiles written by the old UI still load and proxy-esc.js still reads the mirror key.
+function dnsValue() {
+  // "Tùy chỉnh…" picked but nothing typed yet is not a choice — keep reporting what is actually in
+  // force, so an unrelated change (search engine, a header edit) can't write "" over the resolver.
+  if (dnsSelect.value === DNS_CUSTOM) return (dnsCustom.value || "").trim() || dnsCommitted;
+  return dnsSelect.value || "";
+}
+
 // The DNS name/IP sent to the server (a path segment). Empty or the server default means "no
 // interference" → omit the segment, so the request matches the pre-DNS-feature behavior and any
 // VPN/proxy route keeps resolving via its own exit.
 function currentDns() {
-  const v = (dnsInput.value || "").trim();
+  const v = dnsValue();
   if (!v || v === dnsDefault) return "";
   return v;
+}
+
+// Point the control at a stored value: a known preset selects its option, anything else falls to
+// "Tùy chỉnh…" with the value in the field. An unknown name (a resolver the operator removed from
+// the config) therefore stays visible and editable instead of silently becoming the default.
+function setDnsControl(value) {
+  const v = (value || "").trim();
+  dnsCommitted = v;
+  const known = v && dnsPresetNames.includes(v);
+  if (!v) {
+    dnsSelect.value = dnsPresetNames.includes(dnsDefault) ? dnsDefault : dnsPresetNames[0] || "";
+    dnsCustom.value = "";
+  } else if (known) {
+    dnsSelect.value = v;
+    dnsCustom.value = "";
+  } else {
+    dnsSelect.value = DNS_CUSTOM;
+    dnsCustom.value = v;
+  }
+  syncDnsCustomVisibility();
+}
+
+// The field exists only for the custom entry; blank it out of the tab order otherwise.
+function syncDnsCustomVisibility() {
+  const custom = dnsSelect.value === DNS_CUSTOM;
+  dnsCustom.hidden = !custom;
+  dnsCustom.classList.toggle("invalid", custom && !dnsIsValid((dnsCustom.value || "").trim()));
 }
 
 // A DNS switch, like a route switch, rebuilds the transport (its URL changes) and reloads the
 // frame so the page reloads over the newly-selected resolver.
 async function onDnsChange() {
-  const v = (dnsInput.value || "").trim();
-  dnsInput.classList.toggle("invalid", !dnsIsValid(v));
+  syncDnsCustomVisibility();
+  // Picking "Tùy chỉnh…" only reveals the field — there is nothing to apply until something is
+  // typed into it, and applying "" here would silently reset the resolver mid-browse.
+  if (dnsSelect.value === DNS_CUSTOM && !(dnsCustom.value || "").trim()) {
+    dnsCustom.focus();
+    return;
+  }
+  const v = dnsValue();
+  dnsCommitted = v;
   localStorage.setItem(DNS_KEY, v);
   autoSave(); // same deal as the route: persist here, the reload below stays the only reload
   if (!frame || !document.body.classList.contains("browsing")) return;
@@ -168,33 +221,54 @@ async function onDnsChange() {
   }
 }
 
+// "cloudflare" + ["1.1.1.1", …] → "cloudflare (1.1.1.1)". Only the first address is shown: the
+// presets each carry four (v4 + v6) and the label is a picker entry, not documentation.
+function dnsLabel(entry) {
+  const ip = Array.isArray(entry.addresses) ? entry.addresses[0] : null;
+  return ip ? `${entry.name} (${ip})` : entry.name;
+}
+
 async function loadDns() {
-  let list = ["system"];
+  let list = [{ name: "system", addresses: [] }];
   try {
     const res = await fetch("/dns.json");
     if (res.ok) {
       const json = await res.json();
-      if (Array.isArray(json.dns) && json.dns.length) list = json.dns;
+      if (Array.isArray(json.dns) && json.dns.length) {
+        list = json.dns
+          .map((d) => (typeof d === "string" ? { name: d, addresses: [] } : d))
+          .filter((d) => d && typeof d.name === "string" && d.name);
+      }
       if (typeof json.default === "string") dnsDefault = json.default;
     }
   } catch (_) {
     /* fall back to system-only */
   }
-  dnsPresetNames = list;
-  // Preset names become datalist suggestions; the input still accepts a free-typed IP.
-  dnsPresets.replaceChildren();
-  for (const name of list) {
+  dnsPresetNames = list.map((d) => d.name);
+
+  dnsSelect.replaceChildren();
+  for (const entry of list) {
     const opt = document.createElement("option");
-    opt.value = name;
-    dnsPresets.appendChild(opt);
+    opt.value = entry.name;
+    opt.textContent = dnsLabel(entry);
+    dnsSelect.appendChild(opt);
   }
-  const saved = localStorage.getItem(DNS_KEY);
-  dnsInput.value = saved != null && saved !== "" ? saved : dnsDefault;
-  dnsInput.classList.toggle("invalid", !dnsIsValid(dnsInput.value.trim()));
+  const custom = document.createElement("option");
+  custom.value = DNS_CUSTOM;
+  custom.textContent = "Tùy chỉnh…";
+  dnsSelect.appendChild(custom);
+
+  setDnsControl(localStorage.getItem(DNS_KEY) || "");
   dnsSettled = true;
 }
 
-dnsInput.addEventListener("change", onDnsChange);
+dnsSelect.addEventListener("change", onDnsChange);
+// Committing the typed IP on blur/Enter, not on every keystroke: mid-typing values like "1.1" are
+// valid-looking and would each rebuild the transport and reload the page.
+dnsCustom.addEventListener("change", onDnsChange);
+dnsCustom.addEventListener("input", () =>
+  dnsCustom.classList.toggle("invalid", !dnsIsValid((dnsCustom.value || "").trim()))
+);
 
 const dnsReady = loadDns(); // see routesReady
 
@@ -229,30 +303,19 @@ function loadStoredHeaders() {
 }
 let headerOverrides = loadStoredHeaders();
 
-const headersModal = document.getElementById("headers-modal");
 const headersRows = document.getElementById("headers-rows");
 const headersError = document.getElementById("headers-error");
-const headersCounter = document.getElementById("headers-counter");
 const headersAddBtn = document.getElementById("headers-add");
-const headersSaveBtn = document.getElementById("headers-save");
-const headersCancelBtn = document.getElementById("headers-cancel");
-const headersEditBtn = document.getElementById("headers-edit");
 const headersCountBadge = document.getElementById("headers-count");
 
-// "(N)" next to the Headers button when overrides are active; blank when there are none.
+// "(N)" beside the Headers label when overrides are active; blank when there are none.
 function updateHeadersBadge() {
-  headersCountBadge.textContent = headerOverrides.length ? `(${headerOverrides.length})` : "";
+  headersCountBadge.textContent = headerOverrides.length ? ` (${headerOverrides.length})` : "";
+  headersAddBtn.disabled = headersRows.children.length >= MAX_HEADERS;
 }
 
-// Row count / limit indicator, and disable "Add" once the cap is hit.
-function updateHeadersCounter() {
-  const n = headersRows.children.length;
-  headersCounter.textContent = `${n} / ${MAX_HEADERS}`;
-  headersAddBtn.disabled = n >= MAX_HEADERS;
-}
-
-// Build one editable row (name + value + remove). Live validation only tints the field; the
-// authoritative check runs on save (see collectHeaders).
+// Build one editable row (name + value + remove). Typing only tints the field; the authoritative
+// check runs in commitHeaders() when the field is committed (blur / Enter).
 function makeHeaderRow(name = "", value = "") {
   const row = document.createElement("div");
   row.className = "headers-row";
@@ -278,6 +341,21 @@ function makeHeaderRow(name = "", value = "") {
     valueEl.classList.toggle("invalid", byteLen(valueEl.value) > MAX_HEADER_VALUE_BYTES);
   });
 
+  // Committing on `change` rather than `input`: every keystroke of a header value would otherwise
+  // rebuild the transport and reload the proxied page.
+  nameEl.addEventListener("change", commitHeaders);
+  valueEl.addEventListener("change", commitHeaders);
+  // Enter is the natural "done" in a one-line field, and it fires `change` first only if the value
+  // actually differs — commit explicitly so Enter always means the same thing.
+  const onEnter = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitHeaders();
+    }
+  };
+  nameEl.addEventListener("keydown", onEnter);
+  valueEl.addEventListener("keydown", onEnter);
+
   const rm = document.createElement("button");
   rm.type = "button";
   rm.className = "h-remove";
@@ -285,25 +363,20 @@ function makeHeaderRow(name = "", value = "") {
   rm.textContent = "✕";
   rm.addEventListener("click", () => {
     row.remove();
-    updateHeadersCounter();
+    commitHeaders();
   });
 
   row.append(nameEl, valueEl, rm);
   return row;
 }
 
-function openHeadersEditor() {
-  closeSettings(); // don't leave the popover open behind the modal
+// Paint the rows from the live overrides. Called on load and whenever a profile switch replaces
+// them — the editor is on-screen now, so it can't wait to be opened to refresh itself.
+function renderHeaderRows() {
   headersError.hidden = true;
   headersRows.replaceChildren();
   for (const h of headerOverrides) headersRows.appendChild(makeHeaderRow(h.name, h.value));
-  if (!headerOverrides.length) headersRows.appendChild(makeHeaderRow()); // one empty row to start
-  updateHeadersCounter();
-  headersModal.hidden = false;
-}
-
-function closeHeadersEditor() {
-  headersModal.hidden = true;
+  updateHeadersBadge();
 }
 
 // Read the rows back into a validated list, or return {error} for the first problem found. Fully
@@ -328,21 +401,29 @@ function collectHeaders() {
   return { headers: out };
 }
 
-async function saveHeaders() {
+// Commit whatever the rows currently say. There is no Save button any more — the editor is part of
+// the panel, so a committed edit lands like any other setting change. An invalid row shows its
+// reason and leaves the stored overrides untouched: the row is still on screen to be fixed, so
+// nothing is lost, and the transport keeps using the last good set.
+async function commitHeaders() {
   const res = collectHeaders();
-  if (res.error) {
-    headersError.textContent = res.error;
-    headersError.hidden = false;
-    return;
-  }
+  if (res.error) return showHeadersError(res.error);
   // The per-header caps don't bound the document: 100 headers of 10 KiB is already 1 MB, four
   // times what the server accepts. Refuse here, with the reason, rather than saving something
   // that would be silently trimmed by normalize() or rejected by the server.
-  if (!docFits(withHeaders(res.headers))) {
-    headersError.textContent = `Cấu hình vượt quá ${Math.floor(MAX_DOC_BYTES / 1024)} KB — rút ngắn hoặc bớt header.`;
-    headersError.hidden = false;
+  if (!docFits(withHeaders(res.headers)))
+    return showHeadersError(
+      `Cấu hình vượt quá ${Math.floor(MAX_DOC_BYTES / 1024)} KB — rút ngắn hoặc bớt header.`
+    );
+
+  headersError.hidden = true;
+  // Nothing actually changed (a blur with no edit, a removed blank row): don't touch the document,
+  // or every click through the panel would bump `updated` and fire a pointless PUT.
+  if (JSON.stringify(res.headers) === JSON.stringify(headerOverrides)) {
+    updateHeadersBadge();
     return;
   }
+
   headerOverrides = res.headers;
   try {
     localStorage.setItem(HEADERS_KEY, JSON.stringify(headerOverrides));
@@ -351,7 +432,6 @@ async function saveHeaders() {
   }
   updateHeadersBadge();
   autoSave();
-  closeHeadersEditor();
   // Apply immediately while browsing: rebuild the transport (dropping the old WebSocket) and
   // reload the current page so it re-fetches with the new headers.
   if (frame && document.body.classList.contains("browsing")) {
@@ -367,16 +447,18 @@ async function saveHeaders() {
   }
 }
 
-headersEditBtn.addEventListener("click", openHeadersEditor);
-headersCancelBtn.addEventListener("click", closeHeadersEditor);
-headersSaveBtn.addEventListener("click", saveHeaders);
+function showHeadersError(msg) {
+  headersError.textContent = msg;
+  headersError.hidden = false;
+}
+
 headersAddBtn.addEventListener("click", () => {
   if (headersRows.children.length >= MAX_HEADERS) return;
   headersRows.appendChild(makeHeaderRow());
-  updateHeadersCounter();
+  updateHeadersBadge();
   headersRows.lastElementChild.querySelector(".h-name").focus();
 });
-updateHeadersBadge();
+renderHeaderRows();
 
 // --- Configuration profiles: one auto-saved, server-synced document ---
 //
@@ -422,6 +504,7 @@ function lsGet(key) {
 
 const profileSelect = document.getElementById("proxy-profile");
 const profileNewBtn = document.getElementById("profile-new");
+const profileCloneBtn = document.getElementById("profile-clone");
 const profileRenameBtn = document.getElementById("profile-rename");
 const profileDeleteBtn = document.getElementById("profile-delete");
 const profileNote = document.getElementById("profile-note");
@@ -661,7 +744,7 @@ function activeProfile() {
 // The current live settings, as a profile-shaped object.
 //
 // A control that isn't live yet must not speak for the profile. `routePicker` stays hidden until
-// /routes.json resolves — and forever when the server offers only `direct` — and `dnsInput` is
+// /routes.json resolves — and forever when the server offers only `direct` — and the DNS select is
 // empty until /dns.json fills it. Without these fallbacks, changing the search engine inside that
 // window (the engine select is populated synchronously, so it is clickable immediately) would
 // write route:"direct" / dns:"" over whatever the profile had saved, and sync the loss upward.
@@ -670,7 +753,7 @@ function currentConfig() {
   return {
     route: routePicker.hidden ? p.route : routeSelect.value,
     engine: currentEngine(),
-    dns: dnsSettled ? (dnsInput.value || "").trim() : p.dns,
+    dns: dnsSettled ? dnsValue() : p.dns,
     headers: headerOverrides.map((h) => ({ name: h.name, value: h.value })),
   };
 }
@@ -696,9 +779,8 @@ async function applyProfile(p) {
     engineSelect.value = p.engine;
     localStorage.setItem(ENGINE_KEY, p.engine);
   }
-  dnsInput.value = p.dns || "";
+  setDnsControl(p.dns || "");
   localStorage.setItem(DNS_KEY, p.dns || "");
-  dnsInput.classList.toggle("invalid", !dnsIsValid((p.dns || "").trim()));
 
   headerOverrides = (p.headers || []).map((h) => ({ name: h.name, value: h.value }));
   try {
@@ -706,7 +788,7 @@ async function applyProfile(p) {
   } catch (_) {
     /* keep in-memory */
   }
-  updateHeadersBadge();
+  renderHeaderRows(); // the editor is on-screen now, so a profile switch must repaint it
 
   if (frame && document.body.classList.contains("browsing")) {
     try {
@@ -963,16 +1045,47 @@ function showNameError(msg) {
   profileNameError.textContent = msg || "";
   profileNameError.hidden = !msg;
 }
+// A free name of the form "<base> (2)", "<base> (3)", … for the clone dialog's prefill. normalize()
+// would resolve a collision anyway, but silently renaming what the user just typed is worse than
+// offering a name that is already free.
+function suggestCopyName(base) {
+  const trimmed = base.replace(/ \(\d+\)$/, "") || base;
+  for (let n = 2; n < MAX_PROFILES + 2; n++) {
+    const candidate = clip(trimmed, MAX_PROFILE_NAME - ` (${n})`.length) + ` (${n})`;
+    if (!config.profiles.some((p) => p.name.toLowerCase() === candidate.toLowerCase()))
+      return candidate;
+  }
+  return "";
+}
+
+const NAME_MODAL_TEXT = {
+  create: {
+    title: "Tạo hồ sơ mới",
+    sub: "Hồ sơ mới bắt đầu từ cấu hình mặc định (Search, DNS, Route mặc định, không có header).",
+  },
+  clone: {
+    title: "Nhân bản hồ sơ",
+    sub: "", // filled in with the source profile's name
+  },
+  rename: { title: "Đổi tên hồ sơ", sub: "" },
+};
+
 function openNameModal(mode) {
   nameModalMode = mode;
   closeSettings(); // don't leave the popover open behind the modal
   showNameError("");
-  const renaming = mode === "rename";
-  profileNameTitle.textContent = renaming ? "Đổi tên hồ sơ" : "Tạo hồ sơ mới";
-  profileNameSub.textContent = renaming
-    ? `Đặt tên mới cho hồ sơ "${config.active}". Cấu hình của hồ sơ giữ nguyên.`
-    : "Lưu toàn bộ cấu hình hiện tại (Route, DNS, Search và các header ghi đè) thành một hồ sơ.";
-  profileNameInput.value = renaming ? config.active : "";
+  const text = NAME_MODAL_TEXT[mode] || NAME_MODAL_TEXT.create;
+  profileNameTitle.textContent = text.title;
+  if (mode === "rename") {
+    profileNameSub.textContent = `Đặt tên mới cho hồ sơ "${config.active}". Cấu hình của hồ sơ giữ nguyên.`;
+    profileNameInput.value = config.active;
+  } else if (mode === "clone") {
+    profileNameSub.textContent = `Sao chép toàn bộ cấu hình của hồ sơ "${config.active}" sang một hồ sơ mới.`;
+    profileNameInput.value = suggestCopyName(config.active);
+  } else {
+    profileNameSub.textContent = text.sub;
+    profileNameInput.value = "";
+  }
   profileNameModal.hidden = false;
   profileNameInput.focus();
   profileNameInput.select();
@@ -981,8 +1094,15 @@ function closeNameModal() {
   profileNameModal.hidden = true;
 }
 
-// Create copies the CURRENT config into a new profile (and switches to it); rename only relabels
-// the active one. Both share the same name rules, which are the server's rules.
+// The blank config a "Tạo mới" profile starts from. Deliberately not the live settings: under
+// auto-save the active profile already IS the live settings, so a create that copied them would be
+// indistinguishable from "Nhân bản".
+function blankConfig() {
+  return { route: "direct", engine: DEFAULT_ENGINE, dns: "", headers: [] };
+}
+
+// Create starts blank, clone copies the active profile, rename only relabels it. All three share
+// the same name rules, which are the server's rules.
 function submitNameModal() {
   const name = (profileNameInput.value || "").trim();
   if (!name) return showNameError("Nhập tên hồ sơ.");
@@ -998,8 +1118,9 @@ function submitNameModal() {
   } else {
     if (config.profiles.some(taken)) return showNameError("Tên hồ sơ đã tồn tại.");
     if (config.profiles.length >= MAX_PROFILES) return showNameError(`Tối đa ${MAX_PROFILES} hồ sơ.`);
-    const added = { name, ...currentConfig() };
-    // Copying a header-heavy profile is the other way the document can outgrow what the server
+    const source = nameModalMode === "clone" ? currentConfig() : blankConfig();
+    const added = { name, ...source };
+    // Cloning a header-heavy profile is the other way the document can outgrow what the server
     // accepts; say so instead of letting normalize() drop it back off again.
     if (!docFits({ ...config, profiles: [...config.profiles, added] }))
       return showNameError(`Cấu hình vượt quá ${Math.floor(MAX_DOC_BYTES / 1024)} KB.`);
@@ -1009,6 +1130,10 @@ function submitNameModal() {
   closeNameModal();
   touchConfig();
   renderProfileSelect();
+  // Only a blank "Tạo mới" changes what the controls should show. A clone's settings are by
+  // definition the ones already on screen, and a rename touches no setting at all — applying
+  // either would rebuild the transport and reload the proxied page for nothing.
+  if (nameModalMode === "create") applyProfile(activeProfile());
 }
 
 // Xóa: the active profile goes and `default` takes over, applied like any other switch.
@@ -1022,6 +1147,7 @@ function deleteActiveProfile() {
 }
 
 profileNewBtn.addEventListener("click", () => openNameModal("create"));
+profileCloneBtn.addEventListener("click", () => openNameModal("clone"));
 profileRenameBtn.addEventListener("click", () => openNameModal("rename"));
 profileDeleteBtn.addEventListener("click", deleteActiveProfile);
 profileNameSaveBtn.addEventListener("click", submitNameModal);
@@ -1204,7 +1330,7 @@ function flashRow(label, value) {
 function showConfigFlash() {
   if (!configFlash) return;
   const route = !routePicker.hidden ? routeSelect.value : "direct";
-  const dns = (dnsInput.value || "").trim() || dnsDefault;
+  const dns = dnsValue() || dnsDefault;
   const rows = [
     // The profile owns every row below it — and one is always active now, so it always shows.
     flashRow("Hồ sơ", config.active),
@@ -1250,9 +1376,12 @@ if (settingsToggle) {
 }
 // Click outside the popover (and not on the toggle) closes it.
 document.addEventListener("click", (e) => {
-  if (settingsOpen() && !settingsPopover.contains(e.target) && e.target !== settingsToggle) {
-    closeSettings();
-  }
+  if (!settingsOpen() || e.target === settingsToggle) return;
+  // A control that removed itself as part of handling this very click — the ✕ on a header row —
+  // is already detached by the time this runs, so `contains` says false and the popover would
+  // close under the user mid-edit. Treat a detached target as "came from inside".
+  if (!e.target.isConnected) return;
+  if (!settingsPopover.contains(e.target)) closeSettings();
 });
 
 // --- Insecure-TLS: per-host consent dialog + persistent indicator ---
@@ -1353,13 +1482,7 @@ function onHotkey(e) {
     answerConsent(false);
     return;
   }
-  // An open header editor closes on Esc (discarding unsaved edits) before anything else.
-  if (headersModal && !headersModal.hidden) {
-    e.preventDefault();
-    closeHeadersEditor();
-    return;
-  }
-  // Likewise the profile name modal ("Tạo mới" / "Đổi tên").
+  // The profile name modal ("Tạo mới" / "Nhân bản" / "Đổi tên") closes on Esc.
   if (profileNameModal && !profileNameModal.hidden) {
     e.preventDefault();
     closeNameModal();

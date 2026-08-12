@@ -19,8 +19,10 @@ async fn spawn_proxy() -> u16 {
 
 /// Start the proxy with the given `block_private` setting; return its port.
 async fn spawn(block_private: bool) -> u16 {
+    let (resolvers, addresses) = dns::build_defaults().expect("build dns defaults");
     let cfg = Config {
-        dns: dns::build_defaults().expect("build dns defaults"),
+        dns: resolvers,
+        dns_addresses: addresses,
         default_dns: dns::DEFAULT_DNS.to_string(),
         block_private,
         ..Config::default()
@@ -52,13 +54,44 @@ async fn dns_json_lists_presets_with_default_first() {
     let port = spawn_proxy().await;
     let body = http_get_body(port, "/dns.json").await;
     for name in ["system", "cloudflare", "google", "quad9"] {
-        assert!(body.contains(&format!("\"{name}\"")), "missing {name} in {body}");
+        assert!(
+            body.contains(&format!("\"name\":\"{name}\"")),
+            "missing {name} in {body}"
+        );
     }
     assert!(body.contains("\"default\":\"system\""), "default not echoed: {body}");
     // Default is sorted first in the list.
     assert!(
-        body.find("\"system\"").unwrap() < body.find("\"cloudflare\"").unwrap(),
+        body.find("\"name\":\"system\"").unwrap() < body.find("\"name\":\"cloudflare\"").unwrap(),
         "default should sort first: {body}"
+    );
+}
+
+/// The picker labels each resolver with its servers, so the addresses have to survive the trip.
+/// Asserted through the parsed JSON, not substrings: the nesting is what the UI actually reads.
+#[tokio::test]
+async fn dns_json_carries_resolver_addresses() {
+    let port = spawn_proxy().await;
+    let body = http_get_body(port, "/dns.json").await;
+    let doc: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let entries = doc["dns"].as_array().expect("dns array");
+
+    // `system` is the default (first) and has no addresses of its own — the OS picks the server.
+    assert_eq!(entries[0]["name"], "system", "default should sort first: {body}");
+    assert_eq!(
+        entries[0]["addresses"].as_array().expect("addresses array").len(),
+        0,
+        "system should advertise no addresses: {body}"
+    );
+
+    let cloudflare = entries
+        .iter()
+        .find(|e| e["name"] == "cloudflare")
+        .expect("cloudflare entry");
+    let addrs = cloudflare["addresses"].as_array().expect("addresses array");
+    assert!(
+        addrs.iter().any(|a| a == "1.1.1.1"),
+        "cloudflare should list 1.1.1.1: {body}"
     );
 }
 

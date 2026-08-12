@@ -208,13 +208,16 @@ flip to a `warp`/`tor` route the moment a site is blocked. The input also rememb
 
 - **Search engine** — when the input isn't a URL/host it's sent to the selected engine. Default
   is **Brave** (proxy-friendly; Google tends to CAPTCHA proxied traffic). Client-side only.
-- **DNS** — how the **`direct`** route resolves hostnames. An editable combobox: pick a preset
-  (`system`, or DNS-over-HTTPS to `cloudflare` / `google` / `quad9` + any custom `dns:` entries
-  from `config.yaml`, see [`config.example.yaml`](config.example.yaml)), **or type a DNS-server
-  IP** (e.g. `1.1.1.1`, or a LAN resolver) to query it over plain UDP/TCP. `system` (or an empty
-  field) is the **non-interfering default** — no DNS override is sent, so the OS resolver is used
-  and VPN/proxy routes keep resolving at their own exit. Changing it rebuilds the transport and
-  reloads the page, like a route switch; it has no effect on proxied routes.
+- **DNS** — how the **`direct`** route resolves hostnames. A dropdown of the resolvers the server
+  offers, each labelled with its address: `system`, DNS-over-HTTPS to `cloudflare (1.1.1.1)` /
+  `google (8.8.8.8)` / `quad9 (9.9.9.9)`, plus any custom `dns:` entries from `config.yaml` (see
+  [`config.example.yaml`](config.example.yaml)) with their own addresses. The labels come from
+  `/dns.json`, so a resolver you add to the config shows up correctly without touching the
+  frontend. The last entry, **`Tùy chỉnh…`**, reveals a field for **a DNS-server IP** (e.g. a LAN
+  resolver) queried over plain UDP/TCP. `system` is the **non-interfering default** — no DNS
+  override is sent, so the OS resolver is used and VPN/proxy routes keep resolving at their own
+  exit. Changing it rebuilds the transport and reloads the page, like a route switch; it has no
+  effect on proxied routes.
   - A custom DNS is useful when your ISP **DNS-hijacks** a domain (you'll see a TLS cert error
     for the wrong host — the ISP's block page). Note a hijacking ISP may also block by IP/port
     53; a VPN route (`warp`/`tor`) is the more robust bypass.
@@ -231,8 +234,19 @@ History lives entirely in the browser and never leaves it; only the chosen route
 
 The settings panel is one **profile** at a time: search engine, DNS, route, and header overrides
 all belong to the profile named at the top of it. A profile called `default` always exists, and
-every change auto-saves — there is no save button. Create / rename / delete profiles to keep, say,
-a `direct` setup and a `warp + custom headers` setup a dropdown apart.
+every change auto-saves — there is no save button. Keep, say, a `direct` setup and a
+`warp + custom headers` setup a dropdown apart:
+
+- **Tạo mới** — a new profile starting from the defaults (Brave, `system` DNS, `direct`, no
+  headers).
+- **Nhân bản** — a copy of the profile you are on, named `<name> (2)`. Since every edit lands in
+  the active profile, this is how you fork a setup you have already tuned.
+- **Đổi tên** / **Xóa** — both disabled while `default` is selected; it is what everything falls
+  back to.
+
+**Header overrides** are edited in place at the bottom of the panel — name, value, and a ✕ per
+row. An edit commits when the field loses focus (or on Enter); an invalid row says why and leaves
+the previously saved set in force, so a half-typed header never reaches the transport.
 
 Saves go to the browser's `localStorage` first (so the proxy works the same with the server
 offline) and are then pushed to the server, which keeps **one document per browser** so clearing

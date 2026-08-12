@@ -41,6 +41,31 @@ async function serverDoc(request, id) {
 
 const syncStatus = (page) => page.locator("#profile-sync");
 
+/** Drive the DNS control the way a user would: a preset by name, anything else via "Tùy chỉnh…". */
+async function pickDns(page, value) {
+  const presets = await page.locator("#proxy-dns-landing option").evaluateAll((os) =>
+    os.map((o) => o.value)
+  );
+  if (presets.includes(value)) {
+    await page.selectOption("#proxy-dns-landing", value);
+    await expect(page.locator("#proxy-dns-custom")).toBeHidden();
+    return;
+  }
+  await page.selectOption("#proxy-dns-landing", "__custom__");
+  await expect(page.locator("#proxy-dns-custom")).toBeVisible();
+  await page.fill("#proxy-dns-custom", value);
+  await page.locator("#proxy-dns-custom").blur();
+}
+
+/** Add one header override through the inline editor (no modal any more). */
+async function addHeader(page, name, value) {
+  await page.locator("#headers-add").click();
+  const row = page.locator(".headers-row").last();
+  await row.locator(".h-name").fill(name);
+  await row.locator(".h-value").fill(value);
+  await row.locator(".h-value").blur();
+}
+
 /** Wait for the debounced PUT to land. */
 async function expectSynced(page) {
   await expect(syncStatus(page)).toHaveAttribute("data-state", "synced");
@@ -69,7 +94,7 @@ test.describe("configuration profiles", () => {
       "#proxy-engine-landing",
       "#proxy-dns-landing",
       "#proxy-route-landing",
-      "#headers-edit",
+      "#headers-picker",
     ]) {
       await expect(scope.locator(id), `${id} should be nested under the profile`).toHaveCount(1);
     }
@@ -95,8 +120,7 @@ test.describe("configuration profiles", () => {
     await gotoLanding(page);
 
     await page.selectOption("#proxy-engine-landing", "google");
-    await page.fill("#proxy-dns-landing", "1.1.1.1");
-    await page.locator("#proxy-dns-landing").blur();
+    await pickDns(page, "1.1.1.1"); // not a preset name → the custom field
     await page.selectOption("#proxy-route-landing", "fake");
 
     await expectSynced(page);
@@ -163,19 +187,22 @@ test.describe("configuration profiles", () => {
     await seedIdentity(page, id);
     await gotoLanding(page);
 
-    // The new profile copies the current config.
+    // "Tạo mới" starts from the defaults — it leaves `default`'s own settings alone and does not
+    // carry them into the new profile. ("Nhân bản" is what copies; see its own test.)
     await page.selectOption("#proxy-engine-landing", "bing");
     await page.locator("#profile-new").click();
     await page.fill("#profile-name-input", "Công việc");
     await page.locator("#profile-name-save").click();
 
     await expect(page.locator("#proxy-profile")).toHaveValue("Công việc");
-    await expect(page.locator("#proxy-engine-landing")).toHaveValue("bing");
+    await expect(page.locator("#proxy-engine-landing")).toHaveValue("brave");
     await expectSynced(page);
 
     let remote = await serverDoc(request, id);
     expect(remote.profiles.map((p) => p.name)).toEqual(["default", "Công việc"]);
     expect(remote.active).toBe("Công việc");
+    expect(remote.profiles[0].engine, "default kept what it had").toBe("bing");
+    expect(remote.profiles[1].engine, "the new profile started blank").toBe("brave");
 
     // Rename keeps it active and keeps its config.
     await page.locator("#profile-rename").click();
@@ -204,31 +231,118 @@ test.describe("configuration profiles", () => {
 
     // `default` = Brave + system DNS + direct.
     await page.selectOption("#proxy-engine-landing", "brave");
-    await page.fill("#proxy-dns-landing", "system");
-    await page.locator("#proxy-dns-landing").blur();
+    await pickDns(page, "system");
     await page.selectOption("#proxy-route-landing", "direct");
     await expectSynced(page);
 
-    // A second profile with a different everything.
+    // A second profile with a different everything, including a custom DNS IP.
     await page.locator("#profile-new").click();
     await page.fill("#profile-name-input", "Riêng tư");
     await page.locator("#profile-name-save").click();
     await page.selectOption("#proxy-engine-landing", "google");
-    await page.fill("#proxy-dns-landing", "9.9.9.9");
-    await page.locator("#proxy-dns-landing").blur();
+    await pickDns(page, "9.9.9.9");
     await page.selectOption("#proxy-route-landing", "fake");
     await expectSynced(page);
 
-    // Switching back restores all three at once.
+    // Switching back restores all three at once — and puts the DNS control back into preset mode.
     await page.selectOption("#proxy-profile", "default");
     await expect(page.locator("#proxy-engine-landing")).toHaveValue("brave");
     await expect(page.locator("#proxy-dns-landing")).toHaveValue("system");
+    await expect(page.locator("#proxy-dns-custom")).toBeHidden();
     await expect(page.locator("#proxy-route-landing")).toHaveValue("direct");
 
     await page.selectOption("#proxy-profile", "Riêng tư");
     await expect(page.locator("#proxy-engine-landing")).toHaveValue("google");
-    await expect(page.locator("#proxy-dns-landing")).toHaveValue("9.9.9.9");
+    await expect(page.locator("#proxy-dns-landing")).toHaveValue("__custom__");
+    await expect(page.locator("#proxy-dns-custom")).toBeVisible();
+    await expect(page.locator("#proxy-dns-custom")).toHaveValue("9.9.9.9");
     await expect(page.locator("#proxy-route-landing")).toHaveValue("fake");
+  });
+
+  test("DNS presets are labelled with their addresses and only Custom reveals the field", async ({
+    page,
+  }) => {
+    await seedIdentity(page, identity(13));
+    await gotoLanding(page);
+
+    const labels = await page
+      .locator("#proxy-dns-landing option")
+      .evaluateAll((os) => os.map((o) => [o.value, o.textContent.trim()]));
+
+    // The server's own resolvers, each carrying its real IP — no hardcoded list in the frontend.
+    expect(labels.map(([v]) => v)).toEqual([
+      "system",
+      "cloudflare",
+      "google",
+      "quad9",
+      "__custom__",
+    ]);
+    expect(Object.fromEntries(labels).cloudflare).toBe("cloudflare (1.1.1.1)");
+    expect(Object.fromEntries(labels).google).toBe("google (8.8.8.8)");
+    expect(Object.fromEntries(labels).quad9).toBe("quad9 (9.9.9.9)");
+    expect(Object.fromEntries(labels).system, "the OS resolver has no address").toBe("system");
+
+    // The field is for the custom entry only.
+    await expect(page.locator("#proxy-dns-custom")).toBeHidden();
+    await page.selectOption("#proxy-dns-landing", "cloudflare");
+    await expect(page.locator("#proxy-dns-custom")).toBeHidden();
+    await page.selectOption("#proxy-dns-landing", "__custom__");
+    await expect(page.locator("#proxy-dns-custom")).toBeVisible();
+
+    // Selecting Custom without typing anything must not overwrite the saved resolver — not at this
+    // instant, and not on the NEXT unrelated change either. The half-finished state has to keep
+    // reporting the resolver actually in force, or auto-save quietly writes "" over it.
+    expect((await localDoc(page)).profiles[0].dns).toBe("cloudflare");
+    await page.selectOption("#proxy-engine-landing", "bing");
+    await expectSynced(page);
+    const doc = await localDoc(page);
+    expect(doc.profiles[0], "an unrelated edit must not clear the resolver").toMatchObject({
+      engine: "bing",
+      dns: "cloudflare",
+    });
+    expect(
+      await page.evaluate(() => localStorage.getItem("proxy-dns")),
+      "the mirror key and the profile must still agree"
+    ).toBe("cloudflare");
+  });
+
+  test("Nhân bản copies the profile, Tạo mới starts blank", async ({ page }) => {
+    await seedIdentity(page, identity(14));
+    await gotoLanding(page);
+
+    await page.selectOption("#proxy-engine-landing", "google");
+    await pickDns(page, "quad9");
+    await addHeader(page, "X-Clone", "yes");
+    await expectSynced(page);
+
+    // Clone: same settings, new name, prefilled suggestion.
+    await page.locator("#profile-clone").click();
+    await expect(page.locator("#profile-name-input")).toHaveValue("default (2)");
+    await page.locator("#profile-name-save").click();
+
+    await expect(page.locator("#proxy-profile")).toHaveValue("default (2)");
+    await expect(page.locator("#proxy-engine-landing")).toHaveValue("google");
+    await expect(page.locator("#proxy-dns-landing")).toHaveValue("quad9");
+    await expect(page.locator(".headers-row .h-name")).toHaveValue("X-Clone");
+    await expectSynced(page);
+
+    // New: back to the defaults, not a second copy of the live settings.
+    await page.locator("#profile-new").click();
+    await page.fill("#profile-name-input", "Trống");
+    await page.locator("#profile-name-save").click();
+
+    await expect(page.locator("#proxy-profile")).toHaveValue("Trống");
+    await expect(page.locator("#proxy-engine-landing")).toHaveValue("brave");
+    await expect(page.locator("#proxy-dns-landing")).toHaveValue("system");
+    await expect(page.locator(".headers-row")).toHaveCount(0);
+    await expectSynced(page);
+
+    // The clone kept its copy; the original is untouched.
+    const doc = await localDoc(page);
+    expect(doc.profiles.map((p) => p.name)).toEqual(["default", "default (2)", "Trống"]);
+    expect(doc.profiles[1]).toMatchObject({ engine: "google", dns: "quad9" });
+    expect(doc.profiles[1].headers).toEqual([{ name: "X-Clone", value: "yes" }]);
+    expect(doc.profiles[2]).toMatchObject({ engine: "brave", dns: "", headers: [] });
   });
 
   test("the default profile cannot be renamed or deleted", async ({ page }) => {
@@ -247,23 +361,49 @@ test.describe("configuration profiles", () => {
     await expect(page.locator("#profile-delete")).toBeEnabled();
   });
 
-  test("header overrides are part of the profile and auto-save", async ({ page, request }) => {
+  test("header overrides edit in place and auto-save", async ({ page, request }) => {
     const id = identity(10);
     await seedIdentity(page, id);
     await gotoLanding(page);
 
-    await page.locator("#headers-edit").click();
-    await page.locator(".headers-row .h-name").first().fill("X-Test");
-    await page.locator(".headers-row .h-value").first().fill("e2e");
-    await page.locator("#headers-save").click();
+    // No modal: the rows are part of the panel.
+    await expect(page.locator("#headers-modal")).toHaveCount(0);
+    await expect(page.locator("#headers-rows")).toHaveCount(1);
+    await expect(page.locator(".headers-row")).toHaveCount(0);
 
+    await addHeader(page, "X-Test", "e2e");
     await expect(page.locator("#headers-count")).toHaveText("(1)");
     await expectSynced(page);
 
-    const remote = await serverDoc(request, id);
+    let remote = await serverDoc(request, id);
     expect(remote.profiles.find((p) => p.name === "default").headers).toEqual([
       { name: "X-Test", value: "e2e" },
     ]);
+
+    // An invalid name reports itself and leaves the stored set alone.
+    await addHeader(page, "Bad Name", "nope");
+    await expect(page.locator("#headers-error")).toBeVisible();
+    remote = await serverDoc(request, id);
+    expect(remote.profiles[0].headers, "the last good set survives").toEqual([
+      { name: "X-Test", value: "e2e" },
+    ]);
+
+    // Fixing the row commits both.
+    await page.locator(".headers-row").last().locator(".h-name").fill("X-Second");
+    await page.locator(".headers-row").last().locator(".h-name").blur();
+    await expect(page.locator("#headers-error")).toBeHidden();
+    await expectSynced(page);
+    remote = await serverDoc(request, id);
+    expect(remote.profiles[0].headers).toEqual([
+      { name: "X-Test", value: "e2e" },
+      { name: "X-Second", value: "nope" },
+    ]);
+
+    // Removing a row commits too.
+    await page.locator(".headers-row").last().locator(".h-remove").click();
+    await expectSynced(page);
+    remote = await serverDoc(request, id);
+    expect(remote.profiles[0].headers).toEqual([{ name: "X-Test", value: "e2e" }]);
   });
 
   // Migration is the one path that can build a document the server refuses outright — and a

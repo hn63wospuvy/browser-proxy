@@ -68,7 +68,11 @@
             <span class="picker-label">Hồ sơ:</span>
             <span class="profile-controls">
               <select id="proxy-profile" aria-label="Chọn hồ sơ cấu hình"></select>
+              <!-- "Tạo mới" starts from the defaults; "Nhân bản" copies the profile you are on.
+                   Under auto-save the active profile always equals the live settings, so a "new"
+                   button that copied them would just be a second clone button. -->
               <button id="profile-new" type="button" class="profile-btn">Tạo mới</button>
+              <button id="profile-clone" type="button" class="profile-btn">Nhân bản</button>
               <button id="profile-rename" type="button" class="profile-btn">Đổi tên</button>
               <button id="profile-delete" type="button" class="profile-btn danger">Xóa</button>
             </span>
@@ -83,33 +87,44 @@
             Search:
             <select id="proxy-engine-landing" aria-label="Search engine"></select>
           </label>
+          <!-- A plain dropdown of the resolvers the server offers, each labelled with its real
+               addresses (from /dns.json). The last entry, "Tùy chỉnh…", is the only one that
+               reveals the free-text field — a typed server IP is the rare case, so it stays out
+               of the way until asked for. -->
           <label id="dns-picker">
             DNS:
-            <input
-              id="proxy-dns-landing"
-              list="dns-presets"
-              aria-label="DNS server (preset name or IP)"
-              placeholder="system or e.g. 1.1.1.1"
-              spellcheck="false"
-              autocomplete="off"
-            />
-            <datalist id="dns-presets"></datalist>
+            <span class="dns-controls">
+              <select id="proxy-dns-landing" aria-label="DNS resolver"></select>
+              <input
+                id="proxy-dns-custom"
+                aria-label="DNS server IP"
+                placeholder="VD: 1.1.1.1"
+                spellcheck="false"
+                autocomplete="off"
+                hidden
+              />
+            </span>
           </label>
           <label id="route-picker" hidden>
             Route:
             <select id="proxy-route-landing" aria-label="Route"></select>
           </label>
-          <label id="headers-picker">
-            Headers:
-            <button
-              id="headers-edit"
-              type="button"
-              class="picker-btn"
-              aria-label="Chỉnh sửa header ghi đè"
-            >
-              Chỉnh sửa<span id="headers-count" class="headers-count"></span>
-            </button>
-          </label>
+
+          <!-- Header overrides, edited in place: they belong to the profile like every other
+               setting, and a modal made that relationship invisible. Rows are built by index.js. -->
+          <div id="headers-picker" class="headers-block">
+            <div class="headers-head">
+              <span class="picker-label"
+                >Headers:<span id="headers-count" class="headers-count"></span
+              ></span>
+              <button type="button" id="headers-add" class="picker-btn">+ Thêm header</button>
+            </div>
+            <div id="headers-rows" class="headers-rows"></div>
+            <p id="headers-error" class="headers-error" hidden></p>
+            <p id="headers-hint" class="headers-hint">
+              Ghi đè vào mọi yêu cầu qua proxy. Tối đa 100 header, mỗi giá trị ≤ 10240 byte.
+            </p>
+          </div>
         </div>
         <div id="profile-note" class="profile-note"></div>
       </div>
@@ -149,36 +164,8 @@
       🔓 Insecure TLS
     </div>
 
-    <!-- Header-override editor: user-entered name/value pairs the transport injects into every
-         proxied request (overriding same-named browser headers). Stored client-side (localStorage);
-         capped at 100 headers, each value ≤ 10240 bytes. Rows are built dynamically by index.js. -->
-    <div id="headers-modal" class="headers-modal" hidden>
-      <div
-        class="headers-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="headers-title"
-      >
-        <h2 id="headers-title">Ghi đè header</h2>
-        <p class="headers-sub">
-          Các header dưới đây được thêm hoặc ghi đè vào mọi yêu cầu qua proxy. Tối đa 100 header,
-          mỗi giá trị không quá 10240 byte.
-        </p>
-        <div id="headers-rows" class="headers-rows"></div>
-        <p id="headers-error" class="headers-error" hidden></p>
-        <div class="headers-foot">
-          <button type="button" id="headers-add" class="btn-secondary">+ Thêm header</button>
-          <span id="headers-counter" class="headers-counter"></span>
-        </div>
-        <div class="headers-actions">
-          <button type="button" id="headers-cancel" class="btn-secondary">Hủy</button>
-          <button type="button" id="headers-save">Lưu</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Name prompt shared by "Tạo mới" and "Đổi tên" — the two only differ in the title, the
-         blurb and what index.js does with the name, so one dialog serves both. -->
+    <!-- Name prompt shared by "Tạo mới", "Nhân bản" and "Đổi tên" — they only differ in the title,
+         the blurb and what index.js does with the name, so one dialog serves all three. -->
     <div id="profile-name-modal" class="headers-modal" hidden>
       <div
         class="headers-dialog"

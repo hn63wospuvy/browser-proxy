@@ -41,6 +41,10 @@ pub struct Config {
     /// Named DNS resolvers selectable via `?dns=` (applies to the `direct` route only). Always
     /// contains `system` (the OS resolver) plus the built-in DoH presets.
     pub dns: HashMap<String, Arc<DnsResolver>>,
+    /// The server IPs behind each `dns` entry, keyed by the same names. Display-only: `/dns.json`
+    /// hands them to the UI so the picker can read "cloudflare (1.1.1.1)" instead of a bare name.
+    /// Resolution never consults this map — a resolver already knows its own servers.
+    pub dns_addresses: HashMap<String, Vec<String>>,
     /// DNS name used when a connection sends no `?dns=`. Defaults to `system`.
     pub default_dns: String,
     /// TLS termination. `None` (default) serves plain HTTP. `Some(_)` serves HTTPS: with both
@@ -101,6 +105,13 @@ impl Default for Config {
                 m.insert(DEFAULT_DNS.to_string(), Arc::new(DnsResolver::System));
                 m
             },
+            // Must list the same names as `dns` above or `/dns.json` would drop their labels;
+            // the OS resolver has no servers of its own to advertise, hence the empty list.
+            dns_addresses: {
+                let mut m = HashMap::new();
+                m.insert(DEFAULT_DNS.to_string(), Vec::new());
+                m
+            },
             default_dns: DEFAULT_DNS.to_string(),
             tls: None,
             storage: Storage {
@@ -157,8 +168,10 @@ impl Config {
             }
             cfg.routes =
                 crate::route::routes_from_yaml(body).map_err(|e| format!("{path}: {e}"))?;
-            let (dns, default_dns) = dns::dns_from_yaml(body).map_err(|e| format!("{path}: {e}"))?;
+            let (dns, dns_addresses, default_dns) =
+                dns::dns_from_yaml(body).map_err(|e| format!("{path}: {e}"))?;
             cfg.dns = dns;
+            cfg.dns_addresses = dns_addresses;
             cfg.default_dns = default_dns;
             cfg.tls = parse_tls(body).map_err(|e| format!("{path}: {e}"))?;
             if let Some(storage) = parse_storage(body).map_err(|e| format!("{path}: {e}"))? {
@@ -166,7 +179,9 @@ impl Config {
             }
         } else {
             // No config file: still expose the built-in DoH presets alongside `system`.
-            cfg.dns = dns::build_defaults()?;
+            let (dns, dns_addresses) = dns::build_defaults()?;
+            cfg.dns = dns;
+            cfg.dns_addresses = dns_addresses;
             cfg.default_dns = DEFAULT_DNS.to_string();
         }
 

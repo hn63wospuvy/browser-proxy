@@ -84,9 +84,18 @@ pub fn build_ip_resolver(ip: IpAddr) -> Result<Arc<DnsResolver>, String> {
 
 /// The built-in resolver set, always present even with no config file: `system` (OS resolver,
 /// the default) plus DoH to Cloudflare / Google / Quad9 using hickory's preset endpoints.
-pub fn build_defaults() -> Result<HashMap<String, Arc<DnsResolver>>, String> {
+///
+/// Returns the resolver map *and* the server IPs behind each name. The addresses are purely for
+/// display (`/dns.json` labels the picker "cloudflare (1.1.1.1)"), and they are read back out of
+/// the same hickory presets the resolvers are built from — a second hardcoded copy would drift
+/// the day hickory changes an endpoint. `system` gets an empty list: the OS chooses the server,
+/// so there is nothing truthful to show.
+pub fn build_defaults(
+) -> Result<(HashMap<String, Arc<DnsResolver>>, HashMap<String, Vec<String>>), String> {
     let mut m: HashMap<String, Arc<DnsResolver>> = HashMap::new();
+    let mut addresses: HashMap<String, Vec<String>> = HashMap::new();
     m.insert(DEFAULT_DNS.to_string(), Arc::new(DnsResolver::System));
+    addresses.insert(DEFAULT_DNS.to_string(), Vec::new());
     for (name, group) in [
         ("cloudflare", &CLOUDFLARE),
         ("google", &GOOGLE),
@@ -94,8 +103,12 @@ pub fn build_defaults() -> Result<HashMap<String, Arc<DnsResolver>>, String> {
     ] {
         let resolver = build_resolver(ResolverConfig::https(group))?;
         m.insert(name.to_string(), Arc::new(DnsResolver::Hickory(resolver)));
+        addresses.insert(
+            name.to_string(),
+            group.ips.iter().map(|ip| ip.to_string()).collect(),
+        );
     }
-    Ok(m)
+    Ok((m, addresses))
 }
 
 /// The optional `dns:` section of the config file.
@@ -164,13 +177,23 @@ fn build_custom_doh(entry: &DohEntry) -> Result<TokioResolver, String> {
     build_resolver(ResolverConfig::from_parts(None, Vec::new(), servers))
 }
 
-/// Parse the resolver map + default name from a `config.yaml` body. Always includes the
-/// built-ins; custom entries are merged on top. A custom name may not be empty, collide with a
-/// built-in or another custom entry; the chosen `default:` must name a resolver that exists.
-pub fn dns_from_yaml(yaml: &str) -> Result<(HashMap<String, Arc<DnsResolver>>, String), String> {
+/// Parse the resolver map, the matching address map (see [`build_defaults`]) and the default
+/// name from a `config.yaml` body. Always includes the built-ins; custom entries are merged on
+/// top. A custom name may not be empty, collide with a built-in or another custom entry; the
+/// chosen `default:` must name a resolver that exists.
+pub fn dns_from_yaml(
+    yaml: &str,
+) -> Result<
+    (
+        HashMap<String, Arc<DnsResolver>>,
+        HashMap<String, Vec<String>>,
+        String,
+    ),
+    String,
+> {
     let file: DnsFile =
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("dns config parse error: {e}"))?;
-    let mut map = build_defaults()?;
+    let (mut map, mut addresses) = build_defaults()?;
     let mut default = DEFAULT_DNS.to_string();
 
     if let Some(section) = file.dns {
@@ -185,6 +208,9 @@ pub fn dns_from_yaml(yaml: &str) -> Result<(HashMap<String, Arc<DnsResolver>>, S
             {
                 return Err(format!("duplicate dns resolver name: {:?}", entry.name));
             }
+            // The YAML literals are already validated as IPs by `build_custom_doh` above, so
+            // they can be shown as written rather than round-tripped through `IpAddr`.
+            addresses.insert(entry.name.clone(), entry.addresses.clone());
         }
         if let Some(d) = section.default {
             if !map.contains_key(&d) {
@@ -193,7 +219,7 @@ pub fn dns_from_yaml(yaml: &str) -> Result<(HashMap<String, Arc<DnsResolver>>, S
             default = d;
         }
     }
-    Ok((map, default))
+    Ok((map, addresses, default))
 }
 
 #[cfg(test)]
@@ -202,34 +228,44 @@ mod tests {
 
     #[test]
     fn defaults_have_system_and_presets() {
-        let m = build_defaults().unwrap();
+        let (m, addrs) = build_defaults().unwrap();
         for name in ["system", "cloudflare", "google", "quad9"] {
             assert!(m.contains_key(name), "missing built-in {name}");
+            assert!(addrs.contains_key(name), "missing addresses for {name}");
         }
         assert!(matches!(&**m.get("system").unwrap(), DnsResolver::System));
         assert!(matches!(&**m.get("cloudflare").unwrap(), DnsResolver::Hickory(_)));
+        // Taken from hickory's presets, not retyped here — so this only checks the well-known
+        // anycast address is carried through, and that `system` advertises none.
+        assert!(addrs.get("cloudflare").unwrap().contains(&"1.1.1.1".to_string()));
+        assert!(addrs.get("system").unwrap().is_empty());
     }
 
     #[test]
     fn empty_config_is_defaults_with_system_default() {
-        let (m, def) = dns_from_yaml("routes: []").unwrap();
+        let (m, addrs, def) = dns_from_yaml("routes: []").unwrap();
         assert_eq!(def, "system");
         assert!(m.contains_key("system") && m.contains_key("quad9"));
+        assert!(addrs.contains_key("system") && addrs.contains_key("quad9"));
     }
 
     #[test]
     fn custom_resolver_is_added() {
         let y = "dns:\n  resolvers:\n    - name: adguard\n      addresses: [\"94.140.14.14\", \"94.140.15.15\"]\n      url: \"https://dns.adguard-dns.com/dns-query\"\n";
-        let (m, def) = dns_from_yaml(y).unwrap();
+        let (m, addrs, def) = dns_from_yaml(y).unwrap();
         assert!(m.contains_key("adguard"));
         assert!(matches!(&**m.get("adguard").unwrap(), DnsResolver::Hickory(_)));
+        assert_eq!(
+            addrs.get("adguard").unwrap(),
+            &vec!["94.140.14.14".to_string(), "94.140.15.15".to_string()]
+        );
         assert_eq!(def, "system");
     }
 
     #[test]
     fn default_override_must_exist() {
         let ok = "dns:\n  default: cloudflare\n";
-        assert_eq!(dns_from_yaml(ok).unwrap().1, "cloudflare");
+        assert_eq!(dns_from_yaml(ok).unwrap().2, "cloudflare");
         let bad = "dns:\n  default: nope\n";
         assert!(dns_from_yaml(bad).is_err());
     }
@@ -287,7 +323,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits the network (Cloudflare DoH)"]
     async fn cloudflare_doh_resolves_example_com() {
-        let m = build_defaults().unwrap();
+        let (m, _) = build_defaults().unwrap();
         let r = m.get("cloudflare").unwrap();
         let addrs = r.resolve("example.com", 443).await.unwrap();
         assert!(!addrs.is_empty(), "cloudflare DoH returned no addresses");

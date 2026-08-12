@@ -234,18 +234,47 @@ async fn routes_handler(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// List the configured DNS resolver names as JSON, with the server default sorted first and
-/// echoed as `default` so the UI can preselect it. Mirrors `/routes.json`.
+/// One entry of `/dns.json`. Serialized through serde rather than a `format!` template like
+/// `/routes.json`: an object per resolver with a nested array is one escaping mistake away from
+/// invalid JSON, and custom resolver names come from the config file.
+#[derive(serde::Serialize)]
+struct DnsEntry<'a> {
+    name: &'a str,
+    /// The resolver's server IPs, so the UI can label it "cloudflare (1.1.1.1)". Empty for
+    /// `system`, whose servers are whatever the OS is configured with.
+    addresses: &'a [String],
+}
+
+#[derive(serde::Serialize)]
+struct DnsListing<'a> {
+    dns: Vec<DnsEntry<'a>>,
+    default: &'a str,
+}
+
+/// List the configured DNS resolvers as JSON — each with its server addresses — with the server
+/// default sorted first and echoed as `default` so the UI can preselect it. Mirrors
+/// `/routes.json` in ordering.
 async fn dns_handler(State(state): State<AppState>) -> Response {
     let default = state.cfg.default_dns.as_str();
     let mut names: Vec<&String> = state.cfg.dns.keys().collect();
     names.sort_by(|a, b| (a.as_str() != default, a.as_str()).cmp(&(b.as_str() != default, b.as_str())));
-    let items = names
-        .iter()
-        .map(|n| format!("{n:?}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let body = format!("{{\"dns\":[{items}],\"default\":{default:?}}}");
+    let listing = DnsListing {
+        dns: names
+            .iter()
+            .map(|n| DnsEntry {
+                name: n.as_str(),
+                // A resolver with no recorded addresses still lists — the picker needs the name
+                // more than the label.
+                addresses: state.cfg.dns_addresses.get(*n).map_or(&[][..], |a| a.as_slice()),
+            })
+            .collect(),
+        default,
+    };
+    let body = serde_json::to_string(&listing).unwrap_or_else(|_| {
+        // Unreachable: the shape above is plain strings. Degrade to a valid empty listing rather
+        // than 500, so the picker still renders.
+        format!("{{\"dns\":[],\"default\":{default:?}}}")
+    });
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
