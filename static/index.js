@@ -1389,6 +1389,50 @@ document.addEventListener("click", (e) => {
   if (!settingsPopover.contains(e.target)) closeSettings();
 });
 
+// --- The "i" hint next to each setting's label ---
+//
+// Hover and keyboard focus are pure CSS (`.hint:hover` / `:focus-within`). This adds the click
+// toggle, which is the only way in on touch, where there is no hover: tap to pin a bubble open,
+// tap anywhere else to dismiss it. One at a time — two open bubbles would overlap.
+function closeHint(hint) {
+  hint.classList.remove("open");
+  const btn = hint.querySelector(".hint-btn");
+  if (!btn) return;
+  btn.setAttribute("aria-expanded", "false");
+  // The bubble is also shown by `.hint:focus-within` (so tabbing to the button reveals it), and a
+  // click leaves the button focused — without this the class comes off and the bubble stays up,
+  // making the second click on the same "i" look like it did nothing.
+  if (document.activeElement === btn) btn.blur();
+}
+
+function closeHints(except) {
+  for (const hint of document.querySelectorAll(".hint.open")) {
+    if (hint !== except) closeHint(hint);
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest?.(".hint-btn");
+  if (!btn) {
+    closeHints(null);
+    return;
+  }
+  const hint = btn.closest(".hint");
+  // Three of these buttons sit inside a <label>; cancelling the click keeps the label from
+  // forwarding it to its <select>, which would drop the dropdown over the bubble we just opened.
+  e.preventDefault();
+  const wasOpen = hint.classList.contains("open");
+  // Skipping `hint` here matters: closing it would blur this button, and a keyboard user who
+  // pressed Enter on it should keep their focus.
+  closeHints(hint);
+  if (wasOpen) {
+    closeHint(hint);
+    return;
+  }
+  hint.classList.add("open");
+  btn.setAttribute("aria-expanded", "true");
+});
+
 // --- Insecure-TLS: per-host consent dialog + persistent indicator ---
 //
 // The transport (static/hybrid/index.mjs) runs in the bare-mux SharedWorker and can't show UI, so

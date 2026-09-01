@@ -65,7 +65,24 @@
              contents, not its siblings. -->
         <div class="profile-head">
           <div id="profiles-picker" class="picker-row">
-            <span class="picker-label">Hồ sơ:</span>
+            <span class="picker-label"
+              >Hồ sơ:
+              <span class="hint">
+                <button
+                  type="button"
+                  class="hint-btn"
+                  aria-label="Hồ sơ là gì?"
+                  aria-describedby="hint-profile"
+                  aria-expanded="false"
+                >
+                  i
+                </button>
+                <span class="hint-bubble" id="hint-profile" role="tooltip">
+                  Một bộ cấu hình đã lưu: Search, DNS, Route và các header ghi đè. Chuyển hồ sơ là
+                  đổi cả bốn thiết lập cùng lúc — tiện khi bạn có nhiều "kiểu" duyệt khác nhau.
+                </span>
+              </span></span
+            >
             <span class="profile-controls">
               <select id="proxy-profile" aria-label="Chọn hồ sơ cấu hình"></select>
               <!-- "Tạo mới" starts from the defaults; "Nhân bản" copies the profile you are on.
@@ -83,16 +100,55 @@
         </div>
 
         <div class="profile-scope">
-          <label id="engine-picker">
-            Search:
+          <!-- `for` is not optional now: without it a label points at its FIRST labelable
+               descendant, and the "i" <button> comes before the <select>. Clicking "Search:" would
+               toggle the hint instead of opening the dropdown. Each select keeps its own
+               `aria-label` too — the label's text now contains the whole hint bubble. -->
+          <label id="engine-picker" for="proxy-engine-landing">
+            <span class="picker-label"
+              >Search:
+              <span class="hint">
+                <button
+                  type="button"
+                  class="hint-btn"
+                  aria-label="Search dùng để làm gì?"
+                  aria-describedby="hint-engine"
+                  aria-expanded="false"
+                >
+                  i
+                </button>
+                <span class="hint-bubble" id="hint-engine" role="tooltip">
+                  Cỗ máy tìm kiếm dùng khi thứ bạn gõ ở thanh địa chỉ không phải một URL. Chỉ ảnh
+                  hưởng tới trang tìm kiếm được mở, không đổi đường đi của kết nối.
+                </span>
+              </span></span
+            >
             <select id="proxy-engine-landing" aria-label="Search engine"></select>
           </label>
           <!-- A plain dropdown of the resolvers the server offers, each labelled with its real
                addresses (from /dns.json). The last entry, "Tùy chỉnh…", is the only one that
                reveals the free-text field — a typed server IP is the rare case, so it stays out
                of the way until asked for. -->
-          <label id="dns-picker">
-            DNS:
+          <label id="dns-picker" for="proxy-dns-landing">
+            <span class="picker-label"
+              >DNS:
+              <span class="hint">
+                <button
+                  type="button"
+                  class="hint-btn"
+                  aria-label="DNS dùng để làm gì?"
+                  aria-describedby="hint-dns"
+                  aria-expanded="false"
+                >
+                  i
+                </button>
+                <span class="hint-bubble" id="hint-dns" role="tooltip">
+                  Máy chủ phân giải tên miền mà proxy dùng — chỉ áp dụng cho route <b>direct</b>;
+                  các route VPN/proxy tự phân giải ở đầu ra của chúng. Chọn "Tùy chỉnh…" để nhập IP
+                  của một resolver khác.
+                </span>
+              </span></span
+            >
             <span class="dns-controls">
               <select id="proxy-dns-landing" aria-label="DNS resolver"></select>
               <input
@@ -105,8 +161,26 @@
               />
             </span>
           </label>
-          <label id="route-picker" hidden>
-            Route:
+          <label id="route-picker" for="proxy-route-landing" hidden>
+            <span class="picker-label"
+              >Route:
+              <span class="hint">
+                <button
+                  type="button"
+                  class="hint-btn"
+                  aria-label="Route dùng để làm gì?"
+                  aria-describedby="hint-route"
+                  aria-expanded="false"
+                >
+                  i
+                </button>
+                <span class="hint-bubble" id="hint-route" role="tooltip">
+                  Đường ra Internet của mọi yêu cầu: <b>direct</b> đi thẳng từ máy chủ này, các
+                  route khác đi qua VPN/proxy (WARP, Tor…) nên IP và vị trí sẽ khác. Đổi route sẽ
+                  dựng lại kết nối và tải lại trang đang xem.
+                </span>
+              </span></span
+            >
             <select id="proxy-route-landing" aria-label="Route"></select>
           </label>
 
@@ -115,8 +189,24 @@
           <div id="headers-picker" class="headers-block">
             <div class="headers-head">
               <span class="picker-label"
-                >Headers:<span id="headers-count" class="headers-count"></span
-              ></span>
+                >Headers:<span id="headers-count" class="headers-count"></span>
+                <span class="hint">
+                  <button
+                    type="button"
+                    class="hint-btn"
+                    aria-label="Headers dùng để làm gì?"
+                    aria-describedby="hint-headers"
+                    aria-expanded="false"
+                  >
+                    i
+                  </button>
+                  <span class="hint-bubble" id="hint-headers" role="tooltip">
+                    Các header HTTP được ghi đè vào mọi yêu cầu đi qua proxy — ví dụ
+                    <b>User-Agent</b>, <b>Referer</b> hay <b>Cookie</b>. Tên trùng sẽ thay thế
+                    header gốc của trang; để trống tên thì dòng đó bị bỏ qua.
+                  </span>
+                </span></span
+              >
               <button type="button" id="headers-add" class="picker-btn">+ Thêm header</button>
             </div>
             <div id="headers-rows" class="headers-rows"></div>

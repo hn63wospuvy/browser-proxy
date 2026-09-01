@@ -479,6 +479,73 @@ test.describe("configuration profiles", () => {
     ).toEqual([null, null]);
   });
 
+  // The "i" next to each setting's label. Hover is CSS-only; these cover the two things that are
+  // easy to break: the click toggle (which needs a blur, because `:focus-within` also shows the
+  // bubble) and the <label> still belonging to its <select> rather than to the button inside it.
+  test("each setting's label carries an i hint that opens on hover and toggles on click", async ({
+    page,
+  }) => {
+    await seedIdentity(page, identity(15));
+    await gotoLanding(page);
+
+    const bubble = (id) => page.locator(`#hint-${id}`);
+    const btn = (id) => page.locator(`#hint-${id}`).locator("xpath=../button");
+    const ids = ["profile", "engine", "dns", "route", "headers"];
+
+    // One per setting, and every bubble starts hidden.
+    for (const id of ids) {
+      await expect(btn(id), `${id} has an i button`).toHaveCount(1);
+      await expect(bubble(id)).toBeHidden();
+    }
+
+    // Hover reveals it (pure CSS), moving away hides it again.
+    await btn("dns").hover();
+    await expect(bubble("dns")).toBeVisible();
+    await page.mouse.move(0, 0);
+    await expect(bubble("dns")).toBeHidden();
+
+    // Click pins it open — the path touch devices have to use, since they never hover.
+    await btn("route").click();
+    await expect(bubble("route")).toBeVisible();
+    await expect(btn("route")).toHaveAttribute("aria-expanded", "true");
+
+    // Only one at a time.
+    await btn("headers").click();
+    await expect(bubble("route")).toBeHidden();
+    await expect(bubble("headers")).toBeVisible();
+
+    // A second click on the same button unpins it. The pointer is still on the button afterwards,
+    // and hover alone is enough to show a bubble — so move away before asking whether it is gone.
+    await btn("headers").click();
+    await expect(btn("headers")).toHaveAttribute("aria-expanded", "false");
+    await page.mouse.move(0, 0);
+    await expect(bubble("headers")).toBeHidden();
+
+    // A click anywhere else dismisses it too.
+    await btn("engine").click();
+    await page.mouse.move(0, 0);
+    await page.locator("h1").click();
+    await expect(bubble("engine")).toBeHidden();
+  });
+
+  test("the i button does not steal the label's click from its select", async ({ page }) => {
+    await seedIdentity(page, identity(16));
+    await gotoLanding(page);
+
+    const focused = () => page.evaluate(() => document.activeElement.id);
+
+    // A <label> without `for` targets its FIRST labelable descendant — which the i <button> now
+    // is. Clicking the label text must still reach the dropdown, and clicking the i must not.
+    await page.locator("#engine-picker .picker-label").click({ position: { x: 4, y: 8 } });
+    expect(await focused(), "clicking 'Search:' focuses the engine select").toBe(
+      "proxy-engine-landing"
+    );
+
+    await page.locator("#hint-engine").locator("xpath=../button").click();
+    expect(await focused(), "clicking the i focuses the i, not the select").toBe("");
+    await expect(page.locator("#proxy-engine-landing")).toHaveValue("brave");
+  });
+
   test("the removed Cập nhật / Xóa hết buttons are gone", async ({ page }) => {
     await seedIdentity(page, identity(11));
     await gotoLanding(page);

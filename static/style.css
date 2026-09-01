@@ -168,6 +168,107 @@ input:focus {
   filter: none;
 }
 
+/* --- The "i" hint next to each setting's label ---
+   Hover (and keyboard focus) is the primary reveal; the click toggle below it exists for touch,
+   where there is no hover at all. The bubble is a sibling of the button inside `.hint`, so one
+   `position: relative` anchors it without any JS measuring. */
+.hint {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.35rem;
+  vertical-align: middle;
+}
+
+/* Overrides the accent-filled base `button`: this is a quiet marker, not an action. */
+.hint-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.05rem;
+  height: 1.05rem;
+  padding: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 0.72rem;
+  font-style: italic;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  cursor: help;
+}
+
+.hint-btn:hover,
+.hint-btn:focus-visible,
+.hint.open .hint-btn {
+  color: var(--accent);
+  border-color: var(--accent);
+  filter: none;
+}
+
+/* Anchored to the button's left edge and grown rightwards: every label sits at the left of its
+   row, so this is the one direction that can't run off the panel (or, in the ⚙ popover, off the
+   right of the viewport). */
+.hint-bubble {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: -0.4rem;
+  z-index: 60;
+  width: max-content;
+  /* The vw term is what keeps the far end on screen: the deepest label (Headers, indented under
+     the profile) inside the right-pinned ⚙ popover is the tightest case, and it still clears the
+     viewport edge at 320px wide. */
+  max-width: min(280px, 62vw);
+  padding: 0.5rem 0.65rem;
+  font-family: inherit;
+  font-size: 0.78rem;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  white-space: normal;
+  color: var(--fg);
+  background: #0f1319;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px #000a;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease;
+  /* Never hit-testable, pinned open or not. A bubble overhangs the two rows below it — the Route
+     one covers the Headers button — and a transparent bubble lets that click reach its target
+     instead of being swallowed by a tooltip the user has already read. */
+  pointer-events: none;
+}
+
+/* Little arrow pointing back at the button. */
+.hint-bubble::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: 0.7rem;
+  width: 8px;
+  height: 8px;
+  background: #0f1319;
+  border-top: 1px solid var(--border);
+  border-left: 1px solid var(--border);
+  transform: rotate(45deg);
+}
+
+.hint-bubble b {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.hint:hover .hint-bubble,
+.hint:focus-within .hint-bubble,
+.hint.open .hint-bubble {
+  opacity: 1;
+  visibility: visible;
+}
+
 /* Count of active overrides, e.g. "(3)", shown next to the Headers button label. */
 .headers-count {
   margin-left: 0.3rem;
