@@ -36,17 +36,31 @@ cert-broken site can still load, but only after you explicitly allow it. See
 - **Node.js** 18+ (`npm`) — only to *refresh* the vendored client assets. The assets are already
   committed, so a normal build/run needs no Node.
 
-## Setup
+## Installation
+
+### Install from crates.io
+
+```bash
+cargo install browser-proxy
+browser-proxy
+```
+
+`cargo install` compiles it locally (crates.io only hosts source, not binaries) and drops a
+self-contained executable — the client assets are baked in, so nothing else needs to ship
+alongside it — into `~/.cargo/bin`. Make sure that directory is on your `PATH`, then running
+`browser-proxy` starts the server directly.
+
+### Build from source
 
 The client assets are committed to the repo and **embedded into the binary** at build time, so a
 release build is a single self-contained executable — copy it to another machine and run it, with
 no `static/` directory or Node install needed alongside.
 
 ```bash
+git clone https://github.com/hn63wospuvy/browser-proxy.git
+cd browser-proxy
 cargo run --release
 ```
-
-Then open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press Go.
 
 To refresh the vendored client assets (e.g. after bumping their versions), re-run the Node
 script; the updated files are baked in by the next `cargo build`:
@@ -54,6 +68,10 @@ script; the updated files are baked in by the next `cargo build`:
 ```bash
 node scripts/fetch-assets.mjs
 ```
+
+### After starting it
+
+Open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press Go.
 
 > Service workers require a *secure context*. Use `http://localhost` (browsers treat
 > localhost as secure) or put the server behind HTTPS. Plain `http://` on a LAN IP will not
