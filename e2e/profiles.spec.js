@@ -41,7 +41,7 @@ async function serverDoc(request, id) {
 
 const syncStatus = (page) => page.locator("#profile-sync");
 
-/** Drive the DNS control the way a user would: a preset by name, anything else via "Tùy chỉnh…". */
+/** Drive the DNS control the way a user would: a preset by name, anything else via "Custom…". */
 async function pickDns(page, value) {
   const presets = await page.locator("#proxy-dns-landing option").evaluateAll((os) =>
     os.map((o) => o.value)
@@ -187,33 +187,33 @@ test.describe("configuration profiles", () => {
     await seedIdentity(page, id);
     await gotoLanding(page);
 
-    // "Tạo mới" starts from the defaults — it leaves `default`'s own settings alone and does not
-    // carry them into the new profile. ("Nhân bản" is what copies; see its own test.)
+    // "New" starts from the defaults — it leaves `default`'s own settings alone and does not
+    // carry them into the new profile. ("Clone" is what copies; see its own test.)
     await page.selectOption("#proxy-engine-landing", "bing");
     await page.locator("#profile-new").click();
-    await page.fill("#profile-name-input", "Công việc");
+    await page.fill("#profile-name-input", "Work");
     await page.locator("#profile-name-save").click();
 
-    await expect(page.locator("#proxy-profile")).toHaveValue("Công việc");
+    await expect(page.locator("#proxy-profile")).toHaveValue("Work");
     await expect(page.locator("#proxy-engine-landing")).toHaveValue("brave");
     await expectSynced(page);
 
     let remote = await serverDoc(request, id);
-    expect(remote.profiles.map((p) => p.name)).toEqual(["default", "Công việc"]);
-    expect(remote.active).toBe("Công việc");
+    expect(remote.profiles.map((p) => p.name)).toEqual(["default", "Work"]);
+    expect(remote.active).toBe("Work");
     expect(remote.profiles[0].engine, "default kept what it had").toBe("bing");
     expect(remote.profiles[1].engine, "the new profile started blank").toBe("brave");
 
     // Rename keeps it active and keeps its config.
     await page.locator("#profile-rename").click();
-    await page.fill("#profile-name-input", "Việc riêng");
+    await page.fill("#profile-name-input", "Personal");
     await page.locator("#profile-name-save").click();
-    await expect(page.locator("#proxy-profile")).toHaveValue("Việc riêng");
+    await expect(page.locator("#proxy-profile")).toHaveValue("Personal");
     await expectSynced(page);
 
     remote = await serverDoc(request, id);
-    expect(remote.profiles.map((p) => p.name)).toEqual(["default", "Việc riêng"]);
-    expect(remote.active).toBe("Việc riêng");
+    expect(remote.profiles.map((p) => p.name)).toEqual(["default", "Personal"]);
+    expect(remote.active).toBe("Personal");
 
     // Delete falls back to `default`.
     await page.locator("#profile-delete").click();
@@ -237,7 +237,7 @@ test.describe("configuration profiles", () => {
 
     // A second profile with a different everything, including a custom DNS IP.
     await page.locator("#profile-new").click();
-    await page.fill("#profile-name-input", "Riêng tư");
+    await page.fill("#profile-name-input", "Private");
     await page.locator("#profile-name-save").click();
     await page.selectOption("#proxy-engine-landing", "google");
     await pickDns(page, "9.9.9.9");
@@ -251,7 +251,7 @@ test.describe("configuration profiles", () => {
     await expect(page.locator("#proxy-dns-custom")).toBeHidden();
     await expect(page.locator("#proxy-route-landing")).toHaveValue("direct");
 
-    await page.selectOption("#proxy-profile", "Riêng tư");
+    await page.selectOption("#proxy-profile", "Private");
     await expect(page.locator("#proxy-engine-landing")).toHaveValue("google");
     await expect(page.locator("#proxy-dns-landing")).toHaveValue("__custom__");
     await expect(page.locator("#proxy-dns-custom")).toBeVisible();
@@ -306,7 +306,7 @@ test.describe("configuration profiles", () => {
     ).toBe("cloudflare");
   });
 
-  test("Nhân bản copies the profile, Tạo mới starts blank", async ({ page }) => {
+  test("Clone copies the profile, New starts blank", async ({ page }) => {
     await seedIdentity(page, identity(14));
     await gotoLanding(page);
 
@@ -328,10 +328,10 @@ test.describe("configuration profiles", () => {
 
     // New: back to the defaults, not a second copy of the live settings.
     await page.locator("#profile-new").click();
-    await page.fill("#profile-name-input", "Trống");
+    await page.fill("#profile-name-input", "Empty");
     await page.locator("#profile-name-save").click();
 
-    await expect(page.locator("#proxy-profile")).toHaveValue("Trống");
+    await expect(page.locator("#proxy-profile")).toHaveValue("Empty");
     await expect(page.locator("#proxy-engine-landing")).toHaveValue("brave");
     await expect(page.locator("#proxy-dns-landing")).toHaveValue("system");
     await expect(page.locator(".headers-row")).toHaveCount(0);
@@ -339,7 +339,7 @@ test.describe("configuration profiles", () => {
 
     // The clone kept its copy; the original is untouched.
     const doc = await localDoc(page);
-    expect(doc.profiles.map((p) => p.name)).toEqual(["default", "default (2)", "Trống"]);
+    expect(doc.profiles.map((p) => p.name)).toEqual(["default", "default (2)", "Empty"]);
     expect(doc.profiles[1]).toMatchObject({ engine: "google", dns: "quad9" });
     expect(doc.profiles[1].headers).toEqual([{ name: "X-Clone", value: "yes" }]);
     expect(doc.profiles[2]).toMatchObject({ engine: "brave", dns: "", headers: [] });
@@ -355,7 +355,7 @@ test.describe("configuration profiles", () => {
 
     // Another profile re-enables them.
     await page.locator("#profile-new").click();
-    await page.fill("#profile-name-input", "Khác");
+    await page.fill("#profile-name-input", "Other");
     await page.locator("#profile-name-save").click();
     await expect(page.locator("#profile-rename")).toBeEnabled();
     await expect(page.locator("#profile-delete")).toBeEnabled();
@@ -441,7 +441,7 @@ test.describe("configuration profiles", () => {
           ],
         },
       ];
-      while (legacy.length < 50) legacy.push({ name: `hồ sơ ${legacy.length}`, headers: [] });
+      while (legacy.length < 50) legacy.push({ name: `profile ${legacy.length}`, headers: [] });
       localStorage.setItem("proxy-profiles", JSON.stringify(legacy));
       localStorage.setItem("proxy-active-profile", "x".repeat(63) + "\u{1F600}");
       localStorage.setItem("proxy-engine", "google");
@@ -546,7 +546,7 @@ test.describe("configuration profiles", () => {
     await expect(page.locator("#proxy-engine-landing")).toHaveValue("brave");
   });
 
-  test("the removed Cập nhật / Xóa hết buttons are gone", async ({ page }) => {
+  test("the removed Update / Clear all buttons are gone", async ({ page }) => {
     await seedIdentity(page, identity(11));
     await gotoLanding(page);
     await expect(page.locator("#profile-update")).toHaveCount(0);

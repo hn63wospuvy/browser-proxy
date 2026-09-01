@@ -51,7 +51,7 @@
   var defaultRoute = "direct";
   var dnsDefault = "system";
   var dnsNames = ["system"]; // resolver names from /dns.json, for the preset-vs-custom decision
-  // Sentinel value of the "Tùy chỉnh…" option — matches DNS_CUSTOM in index.js.
+  // Sentinel value of the "Custom…" option — matches DNS_CUSTOM in index.js.
   var DNS_CUSTOM = "__custom__";
 
   function ls(key) {
@@ -221,7 +221,7 @@
   function applyTransportAndReload() {
     if (applying) return;
     applying = true;
-    showLoad(currentRealUrl(), "Đang đổi tuyến kết nối…");
+    showLoad(currentRealUrl(), "Switching routes…");
     (async function () {
       try {
         var BM = window.BareMux;
@@ -305,13 +305,13 @@
   routeLabel.appendChild(routeSel);
 
   // DNS: a dropdown of the server's resolvers, mirroring the app shell. The last entry
-  // ("Tùy chỉnh…") is the only one that reveals the free-text field for a typed server IP.
+  // ("Custom…") is the only one that reveals the free-text field for a typed server IP.
   var dnsLabel = labeled("DNS:");
   var dnsSel = document.createElement("select");
   dnsSel.style.cssText = ctlStyle;
   var dnsCustom = document.createElement("input");
   dnsCustom.setAttribute("spellcheck", "false");
-  dnsCustom.placeholder = "VD: 1.1.1.1";
+  dnsCustom.placeholder = "e.g. 1.1.1.1";
   dnsCustom.style.cssText = ctlStyle + "min-width:140px;margin-left:6px;";
   dnsCustom.hidden = true;
   dnsLabel.appendChild(dnsSel);
@@ -338,7 +338,7 @@
   wrap.appendChild(cfg);
 
   var hint = document.createElement("div");
-  hint.textContent = "Nhấn Esc để hiện/ẩn thanh địa chỉ";
+  hint.textContent = "Press Esc to show/hide the address bar";
   hint.style.cssText =
     "position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:2147483647;" +
     "display:none;padding:6px 12px;border-radius:6px;background:rgba(0,0,0,.82);color:#fff;" +
@@ -368,7 +368,7 @@
   loadText.style.cssText = "margin:0;font-size:1.05rem;font-weight:600;";
   var loadHost = document.createElement("span");
   loadHost.style.cssText = "color:#6c8cff;word-break:break-all;";
-  loadText.appendChild(document.createTextNode("Đang tải "));
+  loadText.appendChild(document.createTextNode("Loading "));
   loadText.appendChild(loadHost);
   var loadSub = document.createElement("p");
   loadSub.style.cssText = "margin:0;font-size:.9rem;color:#9aa0a6;min-height:1.2em;";
@@ -388,7 +388,7 @@
     var isTor = /tor/i.test(currentRoute());
     loadEmoji.textContent = isTor ? "🧅" : "🌐";
     loadHost.textContent = hostOf(url);
-    loadSub.textContent = note || (isTor ? "Qua Tor — có thể mất một lúc…" : "");
+    loadSub.textContent = note || (isTor ? "Via Tor — this can take a moment…" : "");
     load.style.display = "flex";
   }
 
@@ -443,7 +443,7 @@
     }
     var custom = document.createElement("option");
     custom.value = DNS_CUSTOM;
-    custom.textContent = "Tùy chỉnh…";
+    custom.textContent = "Custom…";
     dnsSel.appendChild(custom);
     setDnsControl(ls(DNS_KEY) || "");
   }
@@ -491,7 +491,7 @@
   });
   function onDnsChange() {
     dnsCustom.hidden = dnsSel.value !== DNS_CUSTOM;
-    // Picking "Tùy chỉnh…" only reveals the field; there is nothing to apply until it has a value,
+    // Picking "Custom…" only reveals the field; there is nothing to apply until it has a value,
     // and applying "" would silently drop the resolver out from under the page being viewed.
     if (dnsSel.value === DNS_CUSTOM && !(dnsCustom.value || "").trim()) {
       dnsCustom.focus();

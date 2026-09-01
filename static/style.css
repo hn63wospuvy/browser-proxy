@@ -129,7 +129,7 @@ input:focus {
   outline: none;
 }
 
-/* DNS is a dropdown plus an IP field that only appears for "Tùy chỉnh…". */
+/* DNS is a dropdown plus an IP field that only appears for "Custom…". */
 .dns-controls {
   display: flex;
   align-items: center;
@@ -686,7 +686,7 @@ body.browsing #frame-host {
   gap: 0.6rem;
 }
 
-/* The "+ Thêm header" button sits where the other pickers put their control. */
+/* The "+ Add header" button sits where the other pickers put their control. */
 .headers-block .picker-btn {
   padding: 0.35rem 0.6rem;
   font-size: 0.85rem;
@@ -887,8 +887,8 @@ button:disabled {
   color: var(--warn);
 }
 
-/* "Các thiết lập trên thuộc hồ sơ … — tự động lưu." — aligned with the nested settings, since it
-   explains them. A <div>, not a <p>: `#landing p` would out-specify these rules on the landing. */
+/* "These settings belong to the … profile — auto-saved." — aligned with the nested settings, since
+   it explains them. A <div>, not a <p>: `#landing p` would out-specify these rules on the landing. */
 .profile-note {
   padding-left: calc(0.4rem + 0.85rem + 2px);
   font-size: 0.8rem;
@@ -896,7 +896,7 @@ button:disabled {
   color: var(--muted);
 }
 
-/* The profile row's control cluster (dropdown + Tạo mới / Đổi tên / Xóa). Wraps gracefully when
+/* The profile row's control cluster (dropdown + New / Rename / Delete). Wraps gracefully when
    the row is narrow. */
 .profile-controls {
   display: flex;
@@ -927,7 +927,7 @@ button:disabled {
   border-color: var(--error);
 }
 
-/* Name input inside the "Tạo mới" / "Đổi tên" modal. */
+/* Name input inside the "New" / "Rename" modal. */
 .profile-name-input {
   width: 100%;
   padding: 0.5rem 0.7rem;

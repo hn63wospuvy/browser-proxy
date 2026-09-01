@@ -21,7 +21,7 @@ const engineSelect = document.getElementById("proxy-engine-landing");
 const ENGINE_KEY = "proxy-engine";
 
 // DNS control: a plain dropdown of the resolvers the server offers, each labelled with its real
-// addresses, plus a final "Tùy chỉnh…" entry that reveals a free-text field for a server IP.
+// addresses, plus a final "Custom…" entry that reveals a free-text field for a server IP.
 // Affects the `direct` route only (VPN/proxy routes resolve at their exit and keep their own DNS).
 // Empty or the server default means "no interference" — no DNS segment is sent.
 const dnsSelect = document.getElementById("proxy-dns-landing");
@@ -35,7 +35,7 @@ let dnsPresetNames = ["system"]; // preset names from /dns.json (for validation)
 // Whether /dns.json has come back and filled the control. Until it has, the empty select says
 // nothing about the user's choice, so auto-save must not read it (see currentConfig).
 let dnsSettled = false;
-// The last value actually committed. Selecting "Tùy chỉnh…" reveals an empty field, and that
+// The last value actually committed. Selecting "Custom…" reveals an empty field, and that
 // half-finished state must not read as "no resolver": every other reader (auto-save, the transport
 // URL, the Esc flash) would otherwise silently fall back to the server default on the next
 // unrelated interaction — see dnsValue().
@@ -142,7 +142,7 @@ function currentEngine() {
   });
 })();
 
-// --- DNS: a dropdown of the server's resolvers, plus "Tùy chỉnh…" for a typed IP ---
+// --- DNS: a dropdown of the server's resolvers, plus "Custom…" for a typed IP ---
 
 // A loose IPv4/IPv6 literal check for UI feedback; the server validates strictly.
 function isIpLiteral(s) {
@@ -158,7 +158,7 @@ function dnsIsValid(v) {
 // this was one text field — the dropdown is a different way to pick, not a different vocabulary,
 // so profiles written by the old UI still load and proxy-esc.js still reads the mirror key.
 function dnsValue() {
-  // "Tùy chỉnh…" picked but nothing typed yet is not a choice — keep reporting what is actually in
+  // "Custom…" picked but nothing typed yet is not a choice — keep reporting what is actually in
   // force, so an unrelated change (search engine, a header edit) can't write "" over the resolver.
   if (dnsSelect.value === DNS_CUSTOM) return (dnsCustom.value || "").trim() || dnsCommitted;
   return dnsSelect.value || "";
@@ -174,7 +174,7 @@ function currentDns() {
 }
 
 // Point the control at a stored value: a known preset selects its option, anything else falls to
-// "Tùy chỉnh…" with the value in the field. An unknown name (a resolver the operator removed from
+// "Custom…" with the value in the field. An unknown name (a resolver the operator removed from
 // the config) therefore stays visible and editable instead of silently becoming the default.
 function setDnsControl(value) {
   const v = (value || "").trim();
@@ -204,7 +204,7 @@ function syncDnsCustomVisibility() {
 // frame so the page reloads over the newly-selected resolver.
 async function onDnsChange() {
   syncDnsCustomVisibility();
-  // Picking "Tùy chỉnh…" only reveals the field — there is nothing to apply until something is
+  // Picking "Custom…" only reveals the field — there is nothing to apply until something is
   // typed into it, and applying "" here would silently reset the resolver mid-browse.
   if (dnsSelect.value === DNS_CUSTOM && !(dnsCustom.value || "").trim()) {
     dnsCustom.focus();
@@ -260,7 +260,7 @@ async function loadDns() {
   }
   const custom = document.createElement("option");
   custom.value = DNS_CUSTOM;
-  custom.textContent = "Tùy chỉnh…";
+  custom.textContent = "Custom…";
   dnsSelect.appendChild(custom);
 
   setDnsControl(localStorage.getItem(DNS_KEY) || "");
@@ -327,7 +327,7 @@ function makeHeaderRow(name = "", value = "") {
 
   const nameEl = document.createElement("input");
   nameEl.className = "h-name";
-  nameEl.placeholder = "Tên (VD: User-Agent)";
+  nameEl.placeholder = "Name (e.g. User-Agent)";
   nameEl.spellcheck = false;
   nameEl.autocomplete = "off";
   nameEl.value = name;
@@ -338,7 +338,7 @@ function makeHeaderRow(name = "", value = "") {
 
   const valueEl = document.createElement("input");
   valueEl.className = "h-value";
-  valueEl.placeholder = "Giá trị";
+  valueEl.placeholder = "Value";
   valueEl.spellcheck = false;
   valueEl.autocomplete = "off";
   valueEl.value = value;
@@ -364,7 +364,7 @@ function makeHeaderRow(name = "", value = "") {
   const rm = document.createElement("button");
   rm.type = "button";
   rm.className = "h-remove";
-  rm.title = "Xóa header";
+  rm.title = "Remove header";
   rm.textContent = "✕";
   rm.addEventListener("click", () => {
     row.remove();
@@ -393,16 +393,16 @@ function collectHeaders() {
     const name = row.querySelector(".h-name").value.trim();
     const value = row.querySelector(".h-value").value;
     if (!name && !value) continue;
-    if (!name) return { error: "Có dòng thiếu tên header." };
-    if (!HEADER_NAME_RE.test(name)) return { error: `Tên header không hợp lệ: "${name}".` };
-    if (/[\r\n\0]/.test(value)) return { error: `Giá trị của "${name}" chứa ký tự xuống dòng/điều khiển.` };
+    if (!name) return { error: "A row is missing a header name." };
+    if (!HEADER_NAME_RE.test(name)) return { error: `Invalid header name: "${name}".` };
+    if (/[\r\n\0]/.test(value)) return { error: `The value of "${name}" contains a newline or control character.` };
     if (byteLen(value) > MAX_HEADER_VALUE_BYTES)
-      return { error: `Giá trị của "${name}" vượt quá ${MAX_HEADER_VALUE_BYTES} byte.` };
-    if (seen.has(name.toLowerCase())) return { error: `Header trùng tên: "${name}".` };
+      return { error: `The value of "${name}" exceeds ${MAX_HEADER_VALUE_BYTES} bytes.` };
+    if (seen.has(name.toLowerCase())) return { error: `Duplicate header name: "${name}".` };
     seen.add(name.toLowerCase());
     out.push({ name, value });
   }
-  if (out.length > MAX_HEADERS) return { error: `Tối đa ${MAX_HEADERS} header.` };
+  if (out.length > MAX_HEADERS) return { error: `Up to ${MAX_HEADERS} headers.` };
   return { headers: out };
 }
 
@@ -418,7 +418,7 @@ async function commitHeaders() {
   // that would be silently trimmed by normalize() or rejected by the server.
   if (!docFits(withHeaders(res.headers)))
     return showHeadersError(
-      `Cấu hình vượt quá ${Math.floor(MAX_DOC_BYTES / 1024)} KB — rút ngắn hoặc bớt header.`
+      `Config exceeds ${Math.floor(MAX_DOC_BYTES / 1024)} KB — shorten it or remove some headers.`
     );
 
   headersError.hidden = true;
@@ -469,9 +469,9 @@ renderHeaderRows();
 //
 // A profile bundles the user's whole configuration — Route, DNS, Search engine and the header
 // overrides — under a name, and `default` always exists. Profiles used to be opt-in snapshots
-// written only when the user pressed "Cập nhật", so the live config and the saved profile drifted
+// written only when the user pressed "Update", so the live config and the saved profile drifted
 // apart constantly; now every change writes straight into the active profile, which is exactly why
-// "Cập nhật" (and, with `default` always present, "Xóa hết") are gone.
+// "Update" (and, with `default` always present, "Clear all") are gone.
 //
 // `proxy-config` is the source of truth. The four mirror keys (proxy-route / proxy-dns /
 // proxy-engine / proxy-headers) are still written on every change: they're the read-fast copy that
@@ -514,7 +514,7 @@ const profileRenameBtn = document.getElementById("profile-rename");
 const profileDeleteBtn = document.getElementById("profile-delete");
 const profileNote = document.getElementById("profile-note");
 const syncEl = document.getElementById("profile-sync");
-// Name modal, shared by "Tạo mới" and "Đổi tên".
+// Name modal, shared by "New" and "Rename".
 const profileNameModal = document.getElementById("profile-name-modal");
 const profileNameTitle = document.getElementById("profile-name-title");
 const profileNameSub = document.getElementById("profile-name-sub");
@@ -635,7 +635,7 @@ function normalize(doc) {
   };
 
   // Last-resort size guard. The paths that can realistically grow the document (the header editor,
-  // "Tạo mới") refuse with a visible error before it ever gets here — see docFits(). This only
+  // "New") refuse with a visible error before it ever gets here — see docFits(). This only
   // catches storage that arrived already oversized (hand-edited, or written by a future version),
   // where silently dropping the tail beats a document that can never be synced again. `default`
   // is never dropped; a profile that alone blows the budget loses its headers rather than the
@@ -853,11 +853,11 @@ function setSyncStatus(state, text, reason) {
 // landing never flashes a warning before the first attempt has even finished.
 function syncSucceeded() {
   syncSettled = true;
-  setSyncStatus("synced", "Đã đồng bộ");
+  setSyncStatus("synced", "Synced");
 }
 function syncFailed(reason) {
   syncSettled = true;
-  setSyncStatus("local", "Chỉ lưu cục bộ", reason);
+  setSyncStatus("local", "Local only", reason);
 }
 
 function cachedClientId() {
@@ -896,7 +896,7 @@ async function readError(res) {
 function scheduleSync() {
   syncBlocked = false;
   syncSeq++;
-  setSyncStatus("syncing", "Đang lưu…");
+  setSyncStatus("syncing", "Saving…");
   clearTimeout(syncTimer);
   syncTimer = setTimeout(() => {
     syncTimer = null;
@@ -915,12 +915,12 @@ function flushSync() {
 async function pushConfig(keepalive) {
   if (syncBlocked) return;
   // Whose write this is. A slow response that lands after the user has changed something else
-  // must not report "Đã đồng bộ" while that newer document is still only in localStorage.
+  // must not report "Synced" while that newer document is still only in localStorage.
   const seq = syncSeq;
   // The keepalive path can't await: the page may already be gone. A browser with no ID computed
   // yet just pushes on its next change or its next load.
   const id = keepalive ? clientIdValue || cachedClientId() : await resolveClientId();
-  if (!id) return syncFailed("Chưa xác định được ID trình duyệt");
+  if (!id) return syncFailed("Couldn't determine the browser ID");
   const body = JSON.stringify(config);
   try {
     const res = await fetch(`/api/profiles/${id}`, {
@@ -944,9 +944,9 @@ async function pushConfig(keepalive) {
       syncBlocked = true;
       return syncFailed((await readError(res)) || `HTTP ${res.status}`);
     }
-    syncFailed(`Máy chủ lỗi (HTTP ${res.status})`);
+    syncFailed(`Server error (HTTP ${res.status})`);
   } catch (_) {
-    syncFailed("Không kết nối được máy chủ"); // the next change retries
+    syncFailed("Couldn't reach the server"); // the next change retries
   }
 }
 
@@ -954,15 +954,15 @@ async function pushConfig(keepalive) {
 // client wrote it, and two browsers sharing one fingerprint are almost certainly one machine.
 async function syncOnLoad() {
   const id = await resolveClientId();
-  if (!id) return syncFailed("Chưa xác định được ID trình duyệt");
+  if (!id) return syncFailed("Couldn't determine the browser ID");
   let res;
   try {
     res = await fetch(`/api/profiles/${id}`, { cache: "no-store" });
   } catch (_) {
-    return syncFailed("Không kết nối được máy chủ");
+    return syncFailed("Couldn't reach the server");
   }
   if (res.status === 404) return scheduleSync(); // the server has nothing for us yet
-  if (res.status >= 500) return syncFailed(`Máy chủ lỗi (HTTP ${res.status})`);
+  if (res.status >= 500) return syncFailed(`Server error (HTTP ${res.status})`);
   if (!res.ok) {
     syncBlocked = true;
     return syncFailed((await readError(res)) || `HTTP ${res.status}`);
@@ -971,7 +971,7 @@ async function syncOnLoad() {
   try {
     remote = normalize(await res.json());
   } catch (_) {
-    return syncFailed("Máy chủ trả về dữ liệu không đọc được");
+    return syncFailed("Server returned unreadable data");
   }
   if (remote.updated <= config.updated) return scheduleSync(); // ties push local
 
@@ -1001,7 +1001,7 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", flushSync);
 
-// --- The profile control: select / Tạo mới / Đổi tên / Xóa ---
+// --- The profile control: select / New / Rename / Delete ---
 
 // Rebuild the dropdown from the document. No placeholder option — `default` always exists, so
 // "no profile selected" isn't a state any more.
@@ -1028,7 +1028,7 @@ function updateProfileButtons() {
 // Spells out the ownership the indentation only hints at.
 function updateProfileNote() {
   if (!profileNote) return;
-  profileNote.textContent = `Các thiết lập trên thuộc hồ sơ "${config.active}" — tự động lưu.`;
+  profileNote.textContent = `These settings belong to the "${config.active}" profile — auto-saved.`;
 }
 
 // Picking a profile applies its whole configuration at once.
@@ -1042,7 +1042,7 @@ profileSelect.addEventListener("change", () => {
   applyProfile(activeProfile()); // re-read: touchConfig normalizes into fresh objects
 });
 
-// --- The name modal, shared by "Tạo mới" and "Đổi tên" ---
+// --- The name modal, shared by "New" and "Rename" ---
 
 let nameModalMode = "create";
 
@@ -1065,14 +1065,14 @@ function suggestCopyName(base) {
 
 const NAME_MODAL_TEXT = {
   create: {
-    title: "Tạo hồ sơ mới",
-    sub: "Hồ sơ mới bắt đầu từ cấu hình mặc định (Search, DNS, Route mặc định, không có header).",
+    title: "New profile",
+    sub: "A new profile starts from the default settings (default Search, DNS, Route, no headers).",
   },
   clone: {
-    title: "Nhân bản hồ sơ",
+    title: "Clone profile",
     sub: "", // filled in with the source profile's name
   },
-  rename: { title: "Đổi tên hồ sơ", sub: "" },
+  rename: { title: "Rename profile", sub: "" },
 };
 
 function openNameModal(mode) {
@@ -1082,10 +1082,10 @@ function openNameModal(mode) {
   const text = NAME_MODAL_TEXT[mode] || NAME_MODAL_TEXT.create;
   profileNameTitle.textContent = text.title;
   if (mode === "rename") {
-    profileNameSub.textContent = `Đặt tên mới cho hồ sơ "${config.active}". Cấu hình của hồ sơ giữ nguyên.`;
+    profileNameSub.textContent = `Give the "${config.active}" profile a new name. Its settings stay the same.`;
     profileNameInput.value = config.active;
   } else if (mode === "clone") {
-    profileNameSub.textContent = `Sao chép toàn bộ cấu hình của hồ sơ "${config.active}" sang một hồ sơ mới.`;
+    profileNameSub.textContent = `Copy all of the "${config.active}" profile's settings into a new profile.`;
     profileNameInput.value = suggestCopyName(config.active);
   } else {
     profileNameSub.textContent = text.sub;
@@ -1099,9 +1099,9 @@ function closeNameModal() {
   profileNameModal.hidden = true;
 }
 
-// The blank config a "Tạo mới" profile starts from. Deliberately not the live settings: under
+// The blank config a "New" profile starts from. Deliberately not the live settings: under
 // auto-save the active profile already IS the live settings, so a create that copied them would be
-// indistinguishable from "Nhân bản".
+// indistinguishable from "Clone".
 function blankConfig() {
   return { route: "direct", engine: DEFAULT_ENGINE, dns: "", headers: [] };
 }
@@ -1110,38 +1110,38 @@ function blankConfig() {
 // the same name rules, which are the server's rules.
 function submitNameModal() {
   const name = (profileNameInput.value || "").trim();
-  if (!name) return showNameError("Nhập tên hồ sơ.");
-  if (name.length > MAX_PROFILE_NAME) return showNameError(`Tên tối đa ${MAX_PROFILE_NAME} ký tự.`);
+  if (!name) return showNameError("Enter a profile name.");
+  if (name.length > MAX_PROFILE_NAME) return showNameError(`Name is at most ${MAX_PROFILE_NAME} characters.`);
   const taken = (p) => p.name.toLowerCase() === name.toLowerCase();
 
   if (nameModalMode === "rename") {
     const current = activeProfile();
     if (!current || current.name === DEFAULT_PROFILE) return closeNameModal();
     if (config.profiles.some((p) => p !== current && taken(p)))
-      return showNameError("Tên hồ sơ đã tồn tại.");
+      return showNameError("A profile with that name already exists.");
     current.name = name;
   } else {
-    if (config.profiles.some(taken)) return showNameError("Tên hồ sơ đã tồn tại.");
-    if (config.profiles.length >= MAX_PROFILES) return showNameError(`Tối đa ${MAX_PROFILES} hồ sơ.`);
+    if (config.profiles.some(taken)) return showNameError("A profile with that name already exists.");
+    if (config.profiles.length >= MAX_PROFILES) return showNameError(`Up to ${MAX_PROFILES} profiles.`);
     const source = nameModalMode === "clone" ? currentConfig() : blankConfig();
     const added = { name, ...source };
     // Cloning a header-heavy profile is the other way the document can outgrow what the server
     // accepts; say so instead of letting normalize() drop it back off again.
     if (!docFits({ ...config, profiles: [...config.profiles, added] }))
-      return showNameError(`Cấu hình vượt quá ${Math.floor(MAX_DOC_BYTES / 1024)} KB.`);
+      return showNameError(`Config exceeds ${Math.floor(MAX_DOC_BYTES / 1024)} KB.`);
     config.profiles.push(added);
   }
   config.active = name;
   closeNameModal();
   touchConfig();
   renderProfileSelect();
-  // Only a blank "Tạo mới" changes what the controls should show. A clone's settings are by
+  // Only a blank "New" changes what the controls should show. A clone's settings are by
   // definition the ones already on screen, and a rename touches no setting at all — applying
   // either would rebuild the transport and reload the proxied page for nothing.
   if (nameModalMode === "create") applyProfile(activeProfile());
 }
 
-// Xóa: the active profile goes and `default` takes over, applied like any other switch.
+// Delete: the active profile goes and `default` takes over, applied like any other switch.
 function deleteActiveProfile() {
   if (config.active === DEFAULT_PROFILE) return;
   config.profiles = config.profiles.filter((p) => p.name !== config.active);
@@ -1224,15 +1224,15 @@ const loaderSub = document.getElementById("loader-sub");
 
 // Playful status lines cycled while waiting. Tor is slow (relay hops), so it gets its own set.
 const LOAD_MSGS = [
-  "Đang định tuyến yêu cầu…",
-  "Đang thiết lập kết nối an toàn…",
-  "Đang tải nội dung…",
-  "Sắp xong rồi…",
+  "Routing the request…",
+  "Setting up a secure connection…",
+  "Loading content…",
+  "Almost there…",
 ];
 const LOAD_MSGS_TOR = [
-  "Đang bóc từng lớp củ hành… 🧅",
-  "Đang nhảy qua các relay Tor…",
-  "Tor thường chậm hơn, kiên nhẫn chút nhé…",
+  "Peeling back the onion layers… 🧅",
+  "Hopping across Tor relays…",
+  "Tor tends to be slower — hang tight…",
 ];
 
 let loadMsgTimer = null;
@@ -1338,18 +1338,18 @@ function showConfigFlash() {
   const dns = dnsValue() || dnsDefault;
   const rows = [
     // The profile owns every row below it — and one is always active now, so it always shows.
-    flashRow("Hồ sơ", config.active),
+    flashRow("Profile", config.active),
     flashRow("Route", route),
     flashRow("Search", engineLabel(currentEngine())),
     flashRow("DNS", dns),
   ];
   if (headerOverrides.length) {
-    rows.push(flashRow("Headers", `${headerOverrides.length} ghi đè`));
+    rows.push(flashRow("Headers", `${headerOverrides.length} overrides`));
   }
   // Surface the insecure-TLS state too, when the current site is on the unverified path.
   const host = currentTargetHost();
   if (host && insecureHosts.has(host)) {
-    rows.push(flashRow("TLS", "⚠ insecure (không xác thực cert)"));
+    rows.push(flashRow("TLS", "⚠ insecure (cert not verified)"));
   }
   configFlash.replaceChildren(...rows);
   // Restart the fade animation: drop the class, force a reflow, re-add it.
@@ -1531,7 +1531,7 @@ function onHotkey(e) {
     answerConsent(false);
     return;
   }
-  // The profile name modal ("Tạo mới" / "Nhân bản" / "Đổi tên") closes on Esc.
+  // The profile name modal ("New" / "Clone" / "Rename") closes on Esc.
   if (profileNameModal && !profileNameModal.hidden) {
     e.preventDefault();
     closeNameModal();

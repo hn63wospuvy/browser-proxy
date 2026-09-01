@@ -66,35 +66,35 @@
         <div class="profile-head">
           <div id="profiles-picker" class="picker-row">
             <span class="picker-label"
-              >Hồ sơ:
+              >Profile:
               <span class="hint">
                 <button
                   type="button"
                   class="hint-btn"
-                  aria-label="Hồ sơ là gì?"
+                  aria-label="What is a profile?"
                   aria-describedby="hint-profile"
                   aria-expanded="false"
                 >
                   i
                 </button>
                 <span class="hint-bubble" id="hint-profile" role="tooltip">
-                  Một bộ cấu hình đã lưu: Search, DNS, Route và các header ghi đè. Chuyển hồ sơ là
-                  đổi cả bốn thiết lập cùng lúc — tiện khi bạn có nhiều "kiểu" duyệt khác nhau.
+                  A saved set of settings: Search, DNS, Route and the header overrides. Switching
+                  profiles changes all four at once — handy when you have several browsing "styles".
                 </span>
               </span></span
             >
             <span class="profile-controls">
-              <select id="proxy-profile" aria-label="Chọn hồ sơ cấu hình"></select>
-              <!-- "Tạo mới" starts from the defaults; "Nhân bản" copies the profile you are on.
+              <select id="proxy-profile" aria-label="Choose a profile"></select>
+              <!-- "New" starts from the defaults; "Clone" copies the profile you are on.
                    Under auto-save the active profile always equals the live settings, so a "new"
                    button that copied them would just be a second clone button. -->
-              <button id="profile-new" type="button" class="profile-btn">Tạo mới</button>
-              <button id="profile-clone" type="button" class="profile-btn">Nhân bản</button>
-              <button id="profile-rename" type="button" class="profile-btn">Đổi tên</button>
-              <button id="profile-delete" type="button" class="profile-btn danger">Xóa</button>
+              <button id="profile-new" type="button" class="profile-btn">New</button>
+              <button id="profile-clone" type="button" class="profile-btn">Clone</button>
+              <button id="profile-rename" type="button" class="profile-btn">Rename</button>
+              <button id="profile-delete" type="button" class="profile-btn danger">Delete</button>
             </span>
           </div>
-          <!-- Sync state (● Đã đồng bộ / ● Đang lưu… / ● Chỉ lưu cục bộ). Hidden until the first
+          <!-- Sync state (● Synced / ● Saving… / ● Local only). Hidden until the first
                attempt resolves so a freshly-opened landing never flashes a warning. -->
           <div id="profile-sync" class="profile-sync" data-state="syncing" hidden></div>
         </div>
@@ -111,22 +111,23 @@
                 <button
                   type="button"
                   class="hint-btn"
-                  aria-label="Search dùng để làm gì?"
+                  aria-label="What does Search do?"
                   aria-describedby="hint-engine"
                   aria-expanded="false"
                 >
                   i
                 </button>
                 <span class="hint-bubble" id="hint-engine" role="tooltip">
-                  Cỗ máy tìm kiếm dùng khi thứ bạn gõ ở thanh địa chỉ không phải một URL. Chỉ ảnh
-                  hưởng tới trang tìm kiếm được mở, không đổi đường đi của kết nối.
+                  The search engine used when what you type in the address bar isn't a URL. It
+                  only affects which search page opens — it doesn't change how the connection is
+                  routed.
                 </span>
               </span></span
             >
             <select id="proxy-engine-landing" aria-label="Search engine"></select>
           </label>
           <!-- A plain dropdown of the resolvers the server offers, each labelled with its real
-               addresses (from /dns.json). The last entry, "Tùy chỉnh…", is the only one that
+               addresses (from /dns.json). The last entry, "Custom…", is the only one that
                reveals the free-text field — a typed server IP is the rare case, so it stays out
                of the way until asked for. -->
           <label id="dns-picker" for="proxy-dns-landing">
@@ -136,16 +137,16 @@
                 <button
                   type="button"
                   class="hint-btn"
-                  aria-label="DNS dùng để làm gì?"
+                  aria-label="What does DNS do?"
                   aria-describedby="hint-dns"
                   aria-expanded="false"
                 >
                   i
                 </button>
                 <span class="hint-bubble" id="hint-dns" role="tooltip">
-                  Máy chủ phân giải tên miền mà proxy dùng — chỉ áp dụng cho route <b>direct</b>;
-                  các route VPN/proxy tự phân giải ở đầu ra của chúng. Chọn "Tùy chỉnh…" để nhập IP
-                  của một resolver khác.
+                  The name-resolution server the proxy uses — only applies to the <b>direct</b>
+                  route; VPN/proxy routes resolve at their own exit. Pick "Custom…" to enter a
+                  different resolver's IP.
                 </span>
               </span></span
             >
@@ -154,7 +155,7 @@
               <input
                 id="proxy-dns-custom"
                 aria-label="DNS server IP"
-                placeholder="VD: 1.1.1.1"
+                placeholder="e.g. 1.1.1.1"
                 spellcheck="false"
                 autocomplete="off"
                 hidden
@@ -168,16 +169,17 @@
                 <button
                   type="button"
                   class="hint-btn"
-                  aria-label="Route dùng để làm gì?"
+                  aria-label="What does Route do?"
                   aria-describedby="hint-route"
                   aria-expanded="false"
                 >
                   i
                 </button>
                 <span class="hint-bubble" id="hint-route" role="tooltip">
-                  Đường ra Internet của mọi yêu cầu: <b>direct</b> đi thẳng từ máy chủ này, các
-                  route khác đi qua VPN/proxy (WARP, Tor…) nên IP và vị trí sẽ khác. Đổi route sẽ
-                  dựng lại kết nối và tải lại trang đang xem.
+                  The Internet path every request takes: <b>direct</b> goes straight out from this
+                  server; other routes go through a VPN/proxy (WARP, Tor…) so the IP and location
+                  will differ. Changing the route rebuilds the connection and reloads the current
+                  page.
                 </span>
               </span></span
             >
@@ -194,25 +196,26 @@
                   <button
                     type="button"
                     class="hint-btn"
-                    aria-label="Headers dùng để làm gì?"
+                    aria-label="What do Headers do?"
                     aria-describedby="hint-headers"
                     aria-expanded="false"
                   >
                     i
                   </button>
                   <span class="hint-bubble" id="hint-headers" role="tooltip">
-                    Các header HTTP được ghi đè vào mọi yêu cầu đi qua proxy — ví dụ
-                    <b>User-Agent</b>, <b>Referer</b> hay <b>Cookie</b>. Tên trùng sẽ thay thế
-                    header gốc của trang; để trống tên thì dòng đó bị bỏ qua.
+                    HTTP headers overridden on every request through the proxy — e.g.
+                    <b>User-Agent</b>, <b>Referer</b> or <b>Cookie</b>. A matching name replaces
+                    the page's original header; a row with an empty name is skipped.
                   </span>
                 </span></span
               >
-              <button type="button" id="headers-add" class="picker-btn">+ Thêm header</button>
+              <button type="button" id="headers-add" class="picker-btn">+ Add header</button>
             </div>
             <div id="headers-rows" class="headers-rows"></div>
             <p id="headers-error" class="headers-error" hidden></p>
             <p id="headers-hint" class="headers-hint">
-              Ghi đè vào mọi yêu cầu qua proxy. Tối đa 100 header, mỗi giá trị ≤ 10240 byte.
+              Applied to every request through the proxy. Up to 100 headers, each value ≤ 10240
+              bytes.
             </p>
           </div>
         </div>
@@ -234,7 +237,7 @@
         <span class="dot"></span>
         <span class="core" id="loader-core">🌐</span>
       </div>
-      <p class="loader-text">Đang tải <span id="loader-host" class="loader-host"></span></p>
+      <p class="loader-text">Loading <span id="loader-host" class="loader-host"></span></p>
       <p class="loader-sub" id="loader-sub"></p>
     </div>
 
@@ -242,19 +245,19 @@
     <div id="config-flash" class="config-flash" aria-hidden="true"></div>
 
     <!-- Transient hint shown when the bar hides. -->
-    <div id="hint">Nhấn <kbd>Esc</kbd> để ẩn/hiện thanh địa chỉ</div>
+    <div id="hint">Press <kbd>Esc</kbd> to show/hide the address bar</div>
 
     <!-- Persistent indicator: the current site is served with TLS verification disabled. -->
     <div
       id="tls-badge"
       class="tls-badge"
       hidden
-      title="Kết nối tới trang này KHÔNG xác thực chứng chỉ TLS (có thể bị nghe lén)"
+      title="This site's connection does NOT verify its TLS certificate (it could be intercepted)"
     >
       🔓 Insecure TLS
     </div>
 
-    <!-- Name prompt shared by "Tạo mới", "Nhân bản" and "Đổi tên" — they only differ in the title,
+    <!-- Name prompt shared by "New", "Clone" and "Rename" — they only differ in the title,
          the blurb and what index.js does with the name, so one dialog serves all three. -->
     <div id="profile-name-modal" class="headers-modal" hidden>
       <div
@@ -263,22 +266,22 @@
         aria-modal="true"
         aria-labelledby="profile-name-title"
       >
-        <h2 id="profile-name-title">Tạo hồ sơ mới</h2>
+        <h2 id="profile-name-title">New profile</h2>
         <p id="profile-name-sub" class="headers-sub">
-          Lưu toàn bộ cấu hình hiện tại (Route, DNS, Search và các header ghi đè) thành một hồ sơ.
+          Save the current settings (Route, DNS, Search and the header overrides) as a profile.
         </p>
         <input
           id="profile-name-input"
           class="profile-name-input"
-          placeholder="Tên hồ sơ…"
+          placeholder="Profile name…"
           maxlength="64"
           spellcheck="false"
           autocomplete="off"
         />
         <p id="profile-name-error" class="headers-error" hidden></p>
         <div class="headers-actions">
-          <button type="button" id="profile-name-cancel" class="btn-secondary">Hủy</button>
-          <button type="button" id="profile-name-save">Lưu</button>
+          <button type="button" id="profile-name-cancel" class="btn-secondary">Cancel</button>
+          <button type="button" id="profile-name-save">Save</button>
         </div>
       </div>
     </div>
@@ -293,15 +296,15 @@
         aria-labelledby="tls-modal-title"
         aria-describedby="tls-modal-desc"
       >
-        <h2 id="tls-modal-title">⚠️ Chứng chỉ TLS không hợp lệ</h2>
+        <h2 id="tls-modal-title">⚠️ Invalid TLS certificate</h2>
         <p id="tls-modal-desc">
-          Không xác thực được chứng chỉ của <b id="tls-modal-host"></b>. Kết nối tới trang này có
-          thể bị nghe lén hoặc giả mạo (MITM).
+          Couldn't verify the certificate for <b id="tls-modal-host"></b>. The connection to this
+          site could be intercepted or spoofed (MITM).
         </p>
-        <p class="tls-modal-sub">Chỉ tiếp tục nếu bạn thực sự tin tưởng trang này.</p>
+        <p class="tls-modal-sub">Only continue if you genuinely trust this site.</p>
         <div class="tls-actions">
-          <button type="button" id="tls-cancel" class="btn-secondary">Hủy</button>
-          <button type="button" id="tls-proceed" class="btn-danger">Tiếp tục (không an toàn)</button>
+          <button type="button" id="tls-cancel" class="btn-secondary">Cancel</button>
+          <button type="button" id="tls-proceed" class="btn-danger">Proceed (unsafe)</button>
         </div>
       </div>
     </div>

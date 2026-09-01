@@ -229,7 +229,7 @@ flip to a `warp`/`tor` route the moment a site is blocked. The input also rememb
   `google (8.8.8.8)` / `quad9 (9.9.9.9)`, plus any custom `dns:` entries from `config.yaml` (see
   [`config.example.yaml`](config.example.yaml)) with their own addresses. The labels come from
   `/dns.json`, so a resolver you add to the config shows up correctly without touching the
-  frontend. The last entry, **`Tùy chỉnh…`**, reveals a field for **a DNS-server IP** (e.g. a LAN
+  frontend. The last entry, **`Custom…`**, reveals a field for **a DNS-server IP** (e.g. a LAN
   resolver) queried over plain UDP/TCP. `system` is the **non-interfering default** — no DNS
   override is sent, so the OS resolver is used and VPN/proxy routes keep resolving at their own
   exit. Changing it rebuilds the transport and reloads the page, like a route switch; it has no
@@ -253,11 +253,11 @@ all belong to the profile named at the top of it. A profile called `default` alw
 every change auto-saves — there is no save button. Keep, say, a `direct` setup and a
 `warp + custom headers` setup a dropdown apart:
 
-- **Tạo mới** — a new profile starting from the defaults (Brave, `system` DNS, `direct`, no
+- **New** — a new profile starting from the defaults (Brave, `system` DNS, `direct`, no
   headers).
-- **Nhân bản** — a copy of the profile you are on, named `<name> (2)`. Since every edit lands in
+- **Clone** — a copy of the profile you are on, named `<name> (2)`. Since every edit lands in
   the active profile, this is how you fork a setup you have already tuned.
-- **Đổi tên** / **Xóa** — both disabled while `default` is selected; it is what everything falls
+- **Rename** / **Delete** — both disabled while `default` is selected; it is what everything falls
   back to.
 
 **Header overrides** are edited in place at the bottom of the panel — name, value, and a ✕ per
@@ -267,8 +267,8 @@ the previously saved set in force, so a half-typed header never reaches the tran
 Saves go to the browser's `localStorage` first (so the proxy works the same with the server
 offline) and are then pushed to the server, which keeps **one document per browser** so clearing
 site data — or opening the proxy in a second browser on the same machine — gets the settings back.
-A small line under the profile row shows the sync state (`Đã đồng bộ` / `Đang lưu…` /
-`Chỉ lưu cục bộ`).
+A small line under the profile row shows the sync state (`Synced` / `Saving…` /
+`Local only`).
 
 ```yaml
 storage:
