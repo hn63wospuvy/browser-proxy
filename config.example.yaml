@@ -26,19 +26,6 @@ tls:
   # You must import it as a trusted root on each device (and re-import after a restart). For any
   # real deployment, supply your own cert + key above (e.g. from Let's Encrypt).
 
-# Where the server keeps each browser's configuration profiles (the settings panel auto-saves
-# them and syncs them here, keyed by a fingerprint the browser computes). Omit the whole section
-# to use the defaults below. The PROFILES_DIR env var overrides `dir`.
-storage:
-  dir: ./data/profiles     # one <client-id>.json per browser; created on the first write
-  # Cap on stored documents (each at most 256 KiB). A new browser past the cap evicts the
-  # least-recently-synced one, so an unauthenticated endpoint can't fill the disk.
-  max_clients: 5000
-  #
-  # These files hold the user's header overrides in plaintext, exactly as localStorage does. The
-  # ID identifies a browser but proves nothing — anyone who learns one can read that document —
-  # so keep the bind loopback-only (or add auth in front) if that matters.
-
 # Routes selectable from the UI. The built-in `direct` route (`type: system` — the server's own
 # default route table, no proxy) always exists implicitly, so it needs no entry here.
 #

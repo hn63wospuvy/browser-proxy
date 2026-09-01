@@ -5,7 +5,6 @@
   --muted: #9aa0a6;
   --accent: #6c8cff;
   --error: #ff6b6b;
-  --warn: #ffb454; /* degraded-but-working, e.g. saved locally with no server sync */
   --field: #1b1f27;
   --border: #2a2f3a;
 }
@@ -835,8 +834,8 @@ button:disabled {
 
 /* --- Profiles: the profile row, the settings nested under it, and the name modal --- */
 
-/* The profile row + its sync line, closed off by a rule: everything under that rule belongs to
-   the selected profile. */
+/* The profile row, closed off by a rule: everything under that rule belongs to the selected
+   profile. */
 .profile-head {
   display: flex;
   flex-direction: column;
@@ -860,31 +859,6 @@ button:disabled {
 /* Match the tighter rhythm the popover gives the rest of the panel. */
 #settings-popover .profile-scope {
   gap: 0.6rem;
-}
-
-/* One-line sync state with a coloured dot; a failure puts its reason in `title`. Right-aligned so
-   it sits under the controls it describes (the row justifies its cluster to the right). */
-.profile-sync {
-  font-size: 0.8rem;
-  text-align: right;
-  color: var(--muted);
-}
-
-.profile-sync[hidden] {
-  display: none;
-}
-
-.profile-sync::before {
-  content: "●";
-  margin-right: 0.35rem;
-}
-
-.profile-sync[data-state="synced"] {
-  color: var(--accent);
-}
-
-.profile-sync[data-state="local"] {
-  color: var(--warn);
 }
 
 /* "These settings belong to the … profile — auto-saved." — aligned with the nested settings, since

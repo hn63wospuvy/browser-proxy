@@ -111,9 +111,7 @@ async function onRouteChange(value) {
 
 routeSelect.addEventListener("change", () => onRouteChange(routeSelect.value));
 
-// Kept so the load-time sync can wait for the options to exist before repainting the controls
-// from a server document (applyProfile skips a route the select doesn't offer yet).
-const routesReady = loadRoutes();
+loadRoutes();
 
 // --- Search engine (client-side only; always shown — there are always several engines) ---
 
@@ -275,7 +273,7 @@ dnsCustom.addEventListener("input", () =>
   dnsCustom.classList.toggle("invalid", !dnsIsValid((dnsCustom.value || "").trim()))
 );
 
-const dnsReady = loadDns(); // see routesReady
+loadDns();
 
 // --- Header overrides: user-entered name/value pairs injected into every proxied request ---
 //
@@ -414,8 +412,8 @@ async function commitHeaders() {
   const res = collectHeaders();
   if (res.error) return showHeadersError(res.error);
   // The per-header caps don't bound the document: 100 headers of 10 KiB is already 1 MB, four
-  // times what the server accepts. Refuse here, with the reason, rather than saving something
-  // that would be silently trimmed by normalize() or rejected by the server.
+  // times MAX_DOC_BYTES. Refuse here, with the reason, rather than saving something that would be
+  // silently trimmed by normalize().
   if (!docFits(withHeaders(res.headers)))
     return showHeadersError(
       `Config exceeds ${Math.floor(MAX_DOC_BYTES / 1024)} KB — shorten it or remove some headers.`
@@ -423,7 +421,7 @@ async function commitHeaders() {
 
   headersError.hidden = true;
   // Nothing actually changed (a blur with no edit, a removed blank row): don't touch the document,
-  // or every click through the panel would bump `updated` and fire a pointless PUT.
+  // or every click through the panel would bump `updated` and rewrite localStorage for nothing.
   if (JSON.stringify(res.headers) === JSON.stringify(headerOverrides)) {
     updateHeadersBadge();
     return;
@@ -465,7 +463,7 @@ headersAddBtn.addEventListener("click", () => {
 });
 renderHeaderRows();
 
-// --- Configuration profiles: one auto-saved, server-synced document ---
+// --- Configuration profiles: one auto-saved document, kept entirely in localStorage ---
 //
 // A profile bundles the user's whole configuration — Route, DNS, Search engine and the header
 // overrides — under a name, and `default` always exists. Profiles used to be opt-in snapshots
@@ -479,23 +477,15 @@ renderHeaderRows();
 const CONFIG_KEY = "proxy-config";
 const LEGACY_PROFILES_KEY = "proxy-profiles";
 const LEGACY_ACTIVE_KEY = "proxy-active-profile";
-const CLIENT_ID_KEY = "proxy-client-id";
 const DEFAULT_PROFILE = "default";
 const MAX_PROFILES = 50;
 const MAX_PROFILE_NAME = 64;
-const MAX_PROFILE_FIELD = 128; // route / engine / dns — opaque strings, capped as the server caps them
-const SYNC_DEBOUNCE_MS = 500;
-// Must match MAX_BODY_BYTES in src/profiles.rs. The per-field caps alone don't bound the whole
-// document — 100 headers × 10 KiB on each of 50 profiles is ~51 MB — so without this the client
-// could build a perfectly valid-looking document the server refuses outright, and the 4xx rule
-// below would then stop syncing it for good. Enforced at the paths that can actually grow the
+const MAX_PROFILE_FIELD = 128; // route / engine / dns — opaque strings
+// A generous sanity cap on the whole document, so a header-heavy profile (or a hand-edited/legacy
+// import) can't run away inside localStorage. Enforced at the paths that can actually grow the
 // document (header editor, new profile) with a visible error, and again in normalize() as a
-// last-resort trim for imported or hand-edited storage.
+// last-resort trim for storage that arrived already oversized.
 const MAX_DOC_BYTES = 256 * 1024;
-// Browsers cap the total body of `keepalive` requests at 64 KiB. A bigger document simply can't
-// leave on the closing-tab path; it stays in localStorage and goes up on the next load.
-const MAX_KEEPALIVE_BYTES = 60 * 1024;
-const CLIENT_ID_RE = /^[0-9a-f]{32}$/;
 
 // localStorage can throw on read outright (blocked storage, hardened privacy settings), not just
 // fail to persist — every access below goes through this.
@@ -513,7 +503,6 @@ const profileCloneBtn = document.getElementById("profile-clone");
 const profileRenameBtn = document.getElementById("profile-rename");
 const profileDeleteBtn = document.getElementById("profile-delete");
 const profileNote = document.getElementById("profile-note");
-const syncEl = document.getElementById("profile-sync");
 // Name modal, shared by "New" and "Rename".
 const profileNameModal = document.getElementById("profile-name-modal");
 const profileNameTitle = document.getElementById("profile-name-title");
@@ -523,11 +512,10 @@ const profileNameSaveBtn = document.getElementById("profile-name-save");
 const profileNameCancelBtn = document.getElementById("profile-name-cancel");
 const profileNameError = document.getElementById("profile-name-error");
 
-// --- Normalization: the client can never hold a document the server would reject ---
+// --- Normalization: the document in localStorage always stays well-formed ---
 
-// Truncate to at most `max` UTF-16 units without splitting a surrogate pair. A lone surrogate
-// survives JSON.stringify as a bare \uD8xx escape, which serde_json rejects — so a naive slice on
-// a name ending in an emoji would produce a document the server 400s forever.
+// Truncate to at most `max` UTF-16 units without splitting a surrogate pair — a naive slice on a
+// name ending in an emoji would otherwise leave a lone (invalid) surrogate at the end.
 function clip(s, max) {
   if (s.length <= max) return s;
   const code = s.charCodeAt(max - 1);
@@ -636,10 +624,9 @@ function normalize(doc) {
 
   // Last-resort size guard. The paths that can realistically grow the document (the header editor,
   // "New") refuse with a visible error before it ever gets here — see docFits(). This only
-  // catches storage that arrived already oversized (hand-edited, or written by a future version),
-  // where silently dropping the tail beats a document that can never be synced again. `default`
-  // is never dropped; a profile that alone blows the budget loses its headers rather than the
-  // whole profile, so switching to it still works.
+  // catches storage that arrived already oversized (hand-edited, or written by a future version).
+  // `default` is never dropped; a profile that alone blows the budget loses its headers rather
+  // than the whole profile, so switching to it still works.
   while (docBytes(out) > MAX_DOC_BYTES && out.profiles.length > 1) out.profiles.pop();
   if (docBytes(out) > MAX_DOC_BYTES) out.profiles[0].headers = [];
   if (!out.profiles.some((p) => p.name === out.active)) out.active = DEFAULT_PROFILE;
@@ -662,8 +649,7 @@ function loadStoredConfig() {
   try {
     const doc = JSON.parse(raw);
     if (!doc || typeof doc !== "object" || !Array.isArray(doc.profiles)) return null;
-    // One bad clock reading must not pin the document forever: a stamp far in the future would
-    // otherwise beat every server copy on every load, for good.
+    // One bad clock reading must not pin a bogus timestamp forever.
     if (typeof doc.updated === "number" && doc.updated > Date.now() + 60000) doc.updated = Date.now();
     return doc;
   } catch (_) {
@@ -685,28 +671,12 @@ function loadLegacyProfiles() {
   }
 }
 
-// Is there anything of the user's to carry over at all? Decides whether a freshly built document
-// gets to outrank the server's copy (see below).
-function hasLegacyState() {
-  return Boolean(
-    lsGet(ROUTE_KEY) ||
-      lsGet(DNS_KEY) ||
-      lsGet(ENGINE_KEY) ||
-      lsGet(HEADERS_KEY) ||
-      lsGet(LEGACY_PROFILES_KEY)
-  );
-}
-
 function migrateConfig() {
   const stored = loadStoredConfig();
   if (stored) return normalize(stored); // a document already exists: use it and stop
 
   const doc = {
-    // A document invented from an EMPTY storage must lose to anything the server holds — that
-    // recovery ("clear localStorage, get your profiles back") is the whole reason the client ID is
-    // a fingerprint rather than a random UUID. With real settings to carry over there is something
-    // to defend, so the document is stamped now and wins instead.
-    updated: hasLegacyState() ? Date.now() : 0,
+    updated: Date.now(),
     active: DEFAULT_PROFILE,
     profiles: [
       // `default` is exactly what the user is looking at right now, so nothing changes under them.
@@ -727,8 +697,7 @@ function migrateConfig() {
   if (legacyActive && doc.profiles.some((p) => p.name === legacyActive)) doc.active = legacyActive;
 
   // Normalizing matters most right here: the old loader returned up to 50 entries and the UI let a
-  // user genuinely reach that cap, so `default` + 50 legacy = 51 — one over the server's limit.
-  // Un-normalized, every PUT would 400 forever, breaking sync for exactly the heaviest users.
+  // user genuinely reach that cap, so `default` + 50 legacy = 51 — one over MAX_PROFILES.
   const out = normalize(doc);
   try {
     localStorage.setItem(CONFIG_KEY, JSON.stringify(out));
@@ -808,7 +777,7 @@ async function applyProfile(p) {
   }
 }
 
-// --- Auto-save: mirror key → active profile → normalize → localStorage → debounced PUT ---
+// --- Auto-save: mirror key → active profile → normalize → localStorage ---
 
 // Fold the live controls into the active profile. Called right after each mirror-key write so the
 // two can't drift; the caller's own transport rebuild + reload (route, DNS, headers) is untouched,
@@ -820,7 +789,7 @@ function autoSave() {
 
 // The single write path for the document. A localStorage write that throws (quota exceeded,
 // storage blocked) is caught and ignored: the in-memory document stays authoritative for the
-// session and the push still goes out.
+// session.
 function touchConfig() {
   config.updated = Date.now();
   config = normalize(config);
@@ -829,177 +798,7 @@ function touchConfig() {
   } catch (_) {
     /* keep the in-memory copy for this session */
   }
-  scheduleSync();
 }
-
-// --- Server sync: one document per browser, last-write-wins on `updated` ---
-
-let syncTimer = null;
-let syncSettled = false; // the status line stays hidden until the first attempt resolves
-let syncBlocked = false; // 4xx: a document the server will never accept — stop pushing it
-let syncSeq = 0; // bumped per scheduled write, so a slow response can't speak for a newer one
-let clientIdValue = null;
-
-function setSyncStatus(state, text, reason) {
-  if (!syncEl) return;
-  syncEl.dataset.state = state;
-  syncEl.textContent = text;
-  if (reason) syncEl.title = reason;
-  else syncEl.removeAttribute("title");
-  syncEl.hidden = !syncSettled;
-}
-
-// Terminal outcomes go through these; the first one is also what reveals the line, so a fresh
-// landing never flashes a warning before the first attempt has even finished.
-function syncSucceeded() {
-  syncSettled = true;
-  setSyncStatus("synced", "Synced");
-}
-function syncFailed(reason) {
-  syncSettled = true;
-  setSyncStatus("local", "Local only", reason);
-}
-
-function cachedClientId() {
-  const v = lsGet(CLIENT_ID_KEY);
-  return v && CLIENT_ID_RE.test(v) ? v : null;
-}
-
-// clientId() is the global from client-id.js (a classic script loaded just before this one). It
-// caches in localStorage itself, so the cached read here is only a fast path — and the one the
-// keepalive flush depends on, since that path can't await anything.
-async function resolveClientId() {
-  if (clientIdValue) return clientIdValue;
-  clientIdValue = cachedClientId();
-  if (clientIdValue) return clientIdValue;
-  if (typeof clientId !== "function") return null; // client-id.js missing: local-only
-  try {
-    const id = await clientId();
-    clientIdValue = CLIENT_ID_RE.test(id) ? id : null;
-  } catch (_) {
-    clientIdValue = null;
-  }
-  return clientIdValue;
-}
-
-async function readError(res) {
-  try {
-    return (await res.text()).trim().slice(0, 200);
-  } catch (_) {
-    return "";
-  }
-}
-
-// Debouncing collapses a burst of changes (typing a DNS server, flipping through engines) into one
-// PUT. Scheduling also un-blocks a previous 4xx: the document has changed, so it's worth one more
-// attempt — but nothing else ever retries it.
-function scheduleSync() {
-  syncBlocked = false;
-  syncSeq++;
-  setSyncStatus("syncing", "Saving…");
-  clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => {
-    syncTimer = null;
-    pushConfig(false);
-  }, SYNC_DEBOUNCE_MS);
-}
-
-// A pending write must survive the tab closing: `keepalive` lets the request outlive the document.
-function flushSync() {
-  if (syncTimer === null) return;
-  clearTimeout(syncTimer);
-  syncTimer = null;
-  pushConfig(true);
-}
-
-async function pushConfig(keepalive) {
-  if (syncBlocked) return;
-  // Whose write this is. A slow response that lands after the user has changed something else
-  // must not report "Synced" while that newer document is still only in localStorage.
-  const seq = syncSeq;
-  // The keepalive path can't await: the page may already be gone. A browser with no ID computed
-  // yet just pushes on its next change or its next load.
-  const id = keepalive ? clientIdValue || cachedClientId() : await resolveClientId();
-  if (!id) return syncFailed("Couldn't determine the browser ID");
-  const body = JSON.stringify(config);
-  try {
-    const res = await fetch(`/api/profiles/${id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body,
-      // Over the browser's keepalive quota the request would just fail; send it normally and let
-      // the closing tab take its chances. The document is in localStorage either way, and the
-      // next load pushes it.
-      keepalive: keepalive && byteLen(body) <= MAX_KEEPALIVE_BYTES,
-    });
-    if (res.ok) {
-      if (seq === syncSeq) syncSucceeded();
-      return;
-    }
-    if (res.status < 500) {
-      // Not transient — a client-side bug. Never re-PUT a document the server will never accept.
-      // Only when this is still the current document: a late 4xx for a superseded one must not
-      // block the newer write that has already been scheduled.
-      if (seq !== syncSeq) return;
-      syncBlocked = true;
-      return syncFailed((await readError(res)) || `HTTP ${res.status}`);
-    }
-    syncFailed(`Server error (HTTP ${res.status})`);
-  } catch (_) {
-    syncFailed("Couldn't reach the server"); // the next change retries
-  }
-}
-
-// Reconcile with the server once, on load. Clock skew is accepted: `updated` comes from whichever
-// client wrote it, and two browsers sharing one fingerprint are almost certainly one machine.
-async function syncOnLoad() {
-  const id = await resolveClientId();
-  if (!id) return syncFailed("Couldn't determine the browser ID");
-  let res;
-  try {
-    res = await fetch(`/api/profiles/${id}`, { cache: "no-store" });
-  } catch (_) {
-    return syncFailed("Couldn't reach the server");
-  }
-  if (res.status === 404) return scheduleSync(); // the server has nothing for us yet
-  if (res.status >= 500) return syncFailed(`Server error (HTTP ${res.status})`);
-  if (!res.ok) {
-    syncBlocked = true;
-    return syncFailed((await readError(res)) || `HTTP ${res.status}`);
-  }
-  let remote;
-  try {
-    remote = normalize(await res.json());
-  } catch (_) {
-    return syncFailed("Server returned unreadable data");
-  }
-  if (remote.updated <= config.updated) return scheduleSync(); // ties push local
-
-  // The server's copy is newer: adopt it wholesale. Wait for the route/DNS fetches first —
-  // applyProfile skips a route the select doesn't offer yet, and loadDns() would otherwise
-  // overwrite the input right after we set it. Nothing has navigated, so no transport rebuild.
-  await Promise.all([routesReady, dnsReady]);
-  config = remote;
-  try {
-    localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
-  } catch (_) {
-    /* keep the in-memory copy */
-  }
-  renderProfileSelect();
-  try {
-    await applyProfile(activeProfile());
-  } catch (_) {
-    /* blocked storage makes its mirror writes throw; the document is adopted either way */
-  }
-  syncSucceeded();
-}
-
-// The debounce is worthless if a closing tab drops it, and both events are needed: `pagehide`
-// covers navigation away, `visibilitychange` covers mobile task-switching that never fires it.
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") flushSync();
-});
-window.addEventListener("pagehide", flushSync);
 
 // --- The profile control: select / New / Rename / Delete ---
 
@@ -1107,7 +906,7 @@ function blankConfig() {
 }
 
 // Create starts blank, clone copies the active profile, rename only relabels it. All three share
-// the same name rules, which are the server's rules.
+// the same name rules.
 function submitNameModal() {
   const name = (profileNameInput.value || "").trim();
   if (!name) return showNameError("Enter a profile name.");
@@ -1125,8 +924,8 @@ function submitNameModal() {
     if (config.profiles.length >= MAX_PROFILES) return showNameError(`Up to ${MAX_PROFILES} profiles.`);
     const source = nameModalMode === "clone" ? currentConfig() : blankConfig();
     const added = { name, ...source };
-    // Cloning a header-heavy profile is the other way the document can outgrow what the server
-    // accepts; say so instead of letting normalize() drop it back off again.
+    // Cloning a header-heavy profile is the other way the document can outgrow MAX_DOC_BYTES; say
+    // so instead of letting normalize() drop it back off again.
     if (!docFits({ ...config, profiles: [...config.profiles, added] }))
       return showNameError(`Config exceeds ${Math.floor(MAX_DOC_BYTES / 1024)} KB.`);
     config.profiles.push(added);
@@ -1164,10 +963,8 @@ profileNameInput.addEventListener("keydown", (e) => {
   }
 });
 
-// Initial paint (no apply: the mirror keys already drive the controls, so the live config matches),
-// then reconcile with the server.
+// Initial paint (no apply: the mirror keys already drive the controls, so the live config matches).
 renderProfileSelect();
-syncOnLoad();
 
 // Wire the autocomplete dropdown now that the input/form/container all exist.
 autocomplete = initAutocomplete({ input: address, form, container: acContainer });

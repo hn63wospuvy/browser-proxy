@@ -15,9 +15,6 @@
     <script src="/search.js" defer></script>
     <script src="/search-engines.js" defer></script>
     <script src="/autocomplete.js" defer></script>
-    <!-- Defines the global clientId(); index.js needs it for the per-browser profile sync, and
-         `defer` keeps that order (both are classic scripts, executed in document order). -->
-    <script src="/client-id.js" defer></script>
     <script src="/index.js" defer></script>
   </head>
   <body>
@@ -94,9 +91,6 @@
               <button id="profile-delete" type="button" class="profile-btn danger">Delete</button>
             </span>
           </div>
-          <!-- Sync state (● Synced / ● Saving… / ● Local only). Hidden until the first
-               attempt resolves so a freshly-opened landing never flashes a warning. -->
-          <div id="profile-sync" class="profile-sync" data-state="syncing" hidden></div>
         </div>
 
         <div class="profile-scope">

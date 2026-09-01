@@ -4,11 +4,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{DefaultBodyLimit, FromRef, Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, State};
 use axum::http::header::{HeaderName, HeaderValue, CACHE_CONTROL};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::get;
 use axum::Router;
 use tokio::sync::Semaphore;
 use tower_http::services::ServeDir;
@@ -17,7 +17,6 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
 use crate::dns::DnsResolver;
-use crate::profiles::{self, ProfileStore};
 use crate::route::DIRECT;
 use crate::{metrics, wisp};
 
@@ -30,24 +29,13 @@ struct AppState {
     cfg: Arc<Config>,
     /// Limits concurrent Wisp connections; a permit is held for each connection's lifetime.
     conn_sem: Arc<Semaphore>,
-    /// Per-browser configuration documents behind `/api/profiles/:id`.
-    store: Arc<ProfileStore>,
 }
 
-/// Lets the profile handlers ask for just the store (`State<Arc<ProfileStore>>`) instead of the
-/// whole `AppState`, which keeps `src/profiles.rs` unaware of the router's other state.
-impl FromRef<AppState> for Arc<ProfileStore> {
-    fn from_ref(state: &AppState) -> Self {
-        state.store.clone()
-    }
-}
-
-/// Assemble routes: the `/wisp/` WebSocket, the small JSON API (`/routes.json`, `/dns.json`,
-/// `/api/profiles/:id`), plus the frontend + vendored asset trees as the fallback. Everything is
-/// mounted ahead of that fallback, so an API path is never mistaken for a missing asset. Assets
-/// are served from the copy embedded in the binary; if `STATIC_DIR` points at an existing
-/// directory, they're served from there instead. Cross-origin-isolation headers are attached to
-/// every response.
+/// Assemble routes: the `/wisp/` WebSocket, the small JSON API (`/routes.json`, `/dns.json`),
+/// plus the frontend + vendored asset trees as the fallback. Everything is mounted ahead of that
+/// fallback, so an API path is never mistaken for a missing asset. Assets are served from the copy
+/// embedded in the binary; if `STATIC_DIR` points at an existing directory, they're served from
+/// there instead. Cross-origin-isolation headers are attached to every response.
 pub fn build_router(cfg: Arc<Config>) -> Router {
     // Optional on-disk override: serve the frontend from STATIC_DIR when it names an existing
     // directory (iterating without a rebuild); otherwise fall through to the embedded assets so
@@ -64,7 +52,6 @@ pub fn build_router(cfg: Arc<Config>) -> Router {
 
     let state = AppState {
         conn_sem: Arc::new(Semaphore::new(cfg.max_connections)),
-        store: Arc::new(ProfileStore::new(&cfg.storage)),
         cfg,
     };
 
@@ -80,16 +67,7 @@ pub fn build_router(cfg: Arc<Config>) -> Router {
         .route("/wisp/:route/:dns", get(ws_handler_route_dns))
         .route("/debug/stats", get(stats_handler))
         .route("/routes.json", get(routes_handler))
-        .route("/dns.json", get(dns_handler))
-        // Per-browser config sync. The body limit rides on PUT alone: it is the only route that
-        // reads a body, and a limit on GET would be dead weight.
-        .route(
-            "/api/profiles/:id",
-            get(profiles::get_profile).merge(
-                put(profiles::put_profile)
-                    .layer(DefaultBodyLimit::max(profiles::MAX_BODY_BYTES)),
-            ),
-        );
+        .route("/dns.json", get(dns_handler));
 
     // Anything not matched above is looked up as a static asset: from disk when overridden,
     // otherwise from the embedded bundle. Both cover /scram, /baremux, /libcurl, and the root.

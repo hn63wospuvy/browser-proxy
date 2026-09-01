@@ -15,14 +15,6 @@ scripts/package-lock.json
 # Embedded Tor route: arti's directory cache + persistent state/keys
 /arti-data/
 
-# Per-browser configuration documents synced by /api/profiles/ (storage.dir default)
-/data/
-
-# Playwright end-to-end suite: installed packages, run artifacts, generated reports
-/e2e/test-results/
-/e2e/playwright-report/
-/e2e/package-lock.json
-
 # OS
 Thumbs.db
 .DS_Store

@@ -91,7 +91,6 @@ Open **http://localhost:8080/**, type a URL (e.g. `example.com`), and press Go.
 | `MAX_STREAMS` | `256` | Max concurrent streams per connection (further CONNECTs get refused). |
 | `BLOCK_PRIVATE` | `0` | `1`/`true` refuses targets on private/loopback/link-local IPs (SSRF guard). |
 | `HOST_BLACKLIST` | *(empty)* | Comma-separated hostname substrings to refuse. |
-| `PROFILES_DIR` | `./data/profiles` | Where per-browser configuration profiles are stored (see [Configuration profiles](#configuration-profiles-auto-save--sync)). Overrides the config file's `storage.dir`. |
 | `CONFIG` | `config.yaml` | Path to the YAML config (bind address + routes, see below). The default path being absent is fine (routes = `direct` only); an explicitly-set but missing/malformed config aborts startup. `BIND`/`PORT` override the file's `bind`. |
 | `RUST_LOG` | `browser_proxy=info` | Log filter (`tower_http=debug` to log every request). |
 
@@ -264,7 +263,7 @@ flip to a `warp`/`tor` route the moment a site is blocked. The input also rememb
 History lives entirely in the browser and never leaves it; only the chosen route and DNS name/IP
 (as URL path segments) reach the server on each navigation.
 
-## Configuration profiles (auto-save + sync)
+## Configuration profiles (auto-save, local only)
 
 The settings panel is one **profile** at a time: search engine, DNS, route, and header overrides
 all belong to the profile named at the top of it. A profile called `default` always exists, and
@@ -282,31 +281,11 @@ every change auto-saves — there is no save button. Keep, say, a `direct` setup
 row. An edit commits when the field loses focus (or on Enter); an invalid row says why and leaves
 the previously saved set in force, so a half-typed header never reaches the transport.
 
-Saves go to the browser's `localStorage` first (so the proxy works the same with the server
-offline) and are then pushed to the server, which keeps **one document per browser** so clearing
-site data — or opening the proxy in a second browser on the same machine — gets the settings back.
-A small line under the profile row shows the sync state (`Synced` / `Saving…` /
-`Local only`).
+Saves go straight to the browser's `localStorage` — nothing is sent to the server. Clearing site
+data (or switching browsers/machines) loses your profiles; there is no server-side backup or sync.
 
-```yaml
-storage:
-  dir: ./data/profiles     # one <client-id>.json per browser; created on the first write
-  max_clients: 5000        # cap on stored documents; the least-recently-synced is evicted
-```
-
-`PROFILES_DIR` overrides `dir`. The endpoints are `GET`/`PUT /api/profiles/<client-id>`, the body
-being the whole configuration document (≤ 256 KiB, ≤ 50 profiles, ≤ 100 header overrides each).
-
-**This is separation, not authentication.** The client ID is a fingerprint the *browser* computes
-and sends — it identifies a browser but proves nothing, so anyone who learns another ID can read
-and overwrite that document. There is also **no rate limiting** on these endpoints; the body cap
-and `max_clients` are what bound the damage. That is acceptable because the server binds loopback
-by default, so the blast radius is "whoever can already reach the proxy" — who can already open
-Wisp tunnels through it. Do not expose the proxy publicly without putting auth in front of it.
-
-**Header overrides are stored in plaintext** under `storage.dir`, as they already are in the
-browser's `localStorage`. If you put a credential in a header override, the operator of the server
-can read it.
+**Header overrides are stored in plaintext** in the browser's `localStorage`, same as everything
+else in a profile.
 
 ## How it works
 
@@ -330,13 +309,11 @@ can read it.
 
 - [`src/wisp.rs`](src/wisp.rs) — Wisp v1 server: framing, per-stream tokio tasks, flow control, TCP relay.
 - [`src/server.rs`](src/server.rs) — axum router, static serving, COOP/COEP headers, `/wisp/` upgrade.
-- [`src/profiles.rs`](src/profiles.rs) — `/api/profiles/:id` config sync: validation + the atomic file store.
 - [`src/config.rs`](src/config.rs) — env configuration + the SSRF `is_private_ip` guard.
 - [`src/main.rs`](src/main.rs) — bootstrap.
 - [`static/`](static/) — minimal frontend (`index.html`, `index.js`, `sw.js`, …) + vendored client assets.
 - [`scripts/fetch-assets.mjs`](scripts/fetch-assets.mjs) — vendors the client assets from npm.
 - [`tests/wisp_integration.rs`](tests/wisp_integration.rs) — WebSocket → Wisp → TCP relay tests.
-- [`tests/profiles_api.rs`](tests/profiles_api.rs) — profile sync: validation, ID checks, eviction.
 - [`docs/superpowers/specs/`](docs/superpowers/specs/) — design spec.
 
 ## Testing
@@ -344,31 +321,9 @@ can read it.
 ```bash
 cargo test                      # unit + integration (local TCP echo relay)
 cargo test -- --ignored         # also runs the real-internet relay test (needs network)
-cargo test --test profiles_api  # just the config-sync endpoints
 ```
 
-Everything runs offline. The profile-sync tests give each test its own store under the system temp
-directory, so they never touch `./data/` and can run concurrently.
-
-### End-to-end (Playwright)
-
-The configuration-profile UI and its server sync are covered by a browser suite in `e2e/`. It
-drives a real Chromium against a real server: profile CRUD, auto-save reaching both localStorage
-and the server with no button pressed, per-fingerprint isolation, and recovery of a profile from
-the server after `localStorage` is cleared.
-
-```bash
-cargo build                       # the suite launches target/debug/browser-proxy
-cd e2e
-npm install
-npx playwright install chromium   # one-time browser download
-npx playwright test
-```
-
-The suite starts its own server on port 8099 with `e2e/config.e2e.yaml` (no route in it ever dials
-anything, so startup is instant) and points `PROFILES_DIR` at a fresh temp directory, so it never
-touches a real store. Tests run serially and each seeds its own client ID, since a fingerprint is
-per-browser and would otherwise be shared across them.
+Everything runs offline.
 
 ## Scope & limitations
 

@@ -1,6 +1,6 @@
 [package]
 name = "browser-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Self-hosted web proxy: Scramjet client + Rust Wisp backend"
 license = "MIT"

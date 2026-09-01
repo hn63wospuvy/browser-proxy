@@ -25,13 +25,10 @@
   var ENGINE_KEY = "proxy-engine";
   var TRANSPORT = "/hybrid/index.mjs";
   // The three keys above are a read-fast MIRROR of one profile inside the app shell's config
-  // document; a change here has to land in both, or the shell would push the stale profile back
+  // document; a change here has to land in both, or the shell would repaint the stale profile back
   // over it on its next load.
   var CONFIG_KEY = "proxy-config";
-  var CLIENT_ID_KEY = "proxy-client-id";
-  var CLIENT_ID_RE = /^[0-9a-f]{32}$/;
-  var MAX_PROFILE_FIELD = 128; // route / dns / engine, capped exactly as the server caps them
-  var SYNC_DEBOUNCE_MS = 500;
+  var MAX_PROFILE_FIELD = 128; // route / dns / engine
 
   // Mirrors static/search-engines.js — kept in sync by hand since this overlay is self-contained.
   var SEARCH_ENGINES = [
@@ -67,54 +64,14 @@
     } catch (_) {}
   }
 
-  // --- Config document: patch the active profile alongside the mirror key, then push ---
+  // --- Config document: patch the active profile alongside the mirror key ---
   //
   // Only ONE field of the active profile is ever touched here. Everything else about the document
   // — creating it, migrating the legacy keys, normalizing, choosing the active profile — stays the
   // app shell's job; this overlay is deliberately self-contained and must not grow a second copy
   // of that logic.
 
-  var syncTimer = null;
-  var pendingDoc = null;
-
-  function cachedClientId() {
-    var v = ls(CLIENT_ID_KEY);
-    return v && CLIENT_ID_RE.test(v) ? v : null;
-  }
-
-  function pushConfig(keepalive) {
-    var id = cachedClientId();
-    if (!id || !pendingDoc) return;
-    var body = JSON.stringify(pendingDoc);
-    pendingDoc = null;
-    try {
-      fetch("/api/profiles/" + id, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: body,
-        keepalive: keepalive,
-      }).catch(function () {
-        /* offline / server down: the shell re-pushes from localStorage on its next load */
-      });
-    } catch (_) {}
-  }
-
-  // A route or DNS change reloads the page almost immediately, which would kill the debounce — so
-  // the pending write is flushed on the way out with `keepalive`, exactly like the app shell does.
-  function flushSync() {
-    if (syncTimer === null) return;
-    clearTimeout(syncTimer);
-    syncTimer = null;
-    pushConfig(true);
-  }
-
-  window.addEventListener("pagehide", flushSync);
-  document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "hidden") flushSync();
-  });
-
-  // Patch one field of the active profile and schedule the push. A fingerprint is never computed
-  // here: with no cached ID this writes locally only, and the app shell pushes on its next load.
+  // Patch one field of the active profile in the document already in localStorage.
   function patchConfig(field, value) {
     var raw = ls(CONFIG_KEY);
     if (!raw) return; // no document yet: the shell builds one (migration) on its next load
@@ -136,14 +93,6 @@
     active[field] = String(value == null ? "" : value).slice(0, MAX_PROFILE_FIELD);
     doc.updated = Date.now();
     setLs(CONFIG_KEY, JSON.stringify(doc));
-
-    if (!cachedClientId()) return;
-    pendingDoc = doc;
-    clearTimeout(syncTimer);
-    syncTimer = setTimeout(function () {
-      syncTimer = null;
-      pushConfig(false);
-    }, SYNC_DEBOUNCE_MS);
   }
 
   // The real URL is the single encoded path segment right after the prefix (default codec is
