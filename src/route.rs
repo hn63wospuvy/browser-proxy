@@ -124,23 +124,37 @@ struct ConfigFile {
 }
 
 /// One route entry as written in YAML, tagged by `type`.
+///
+/// Every variant carries `enabled` (default `true`): an entry with `enabled: false` is parsed
+/// and validated but never built, so a disabled `warp` costs no device registration and a
+/// disabled `tor` no arti bootstrap.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum RouteSpec {
+    /// The server's own default route table — no proxy, no tunnel. This is what the built-in
+    /// `direct` route is; declaring it explicitly exists so it can be turned off
+    /// (`enabled: false`) or given another name.
+    System {
+        name: String,
+        enabled: Option<bool>,
+    },
     Socks5 {
         name: String,
+        enabled: Option<bool>,
         address: String,
         username: Option<String>,
         password: Option<String>,
     },
     Http {
         name: String,
+        enabled: Option<bool>,
         address: String,
         username: Option<String>,
         password: Option<String>,
     },
     Wireguard {
         name: String,
+        enabled: Option<bool>,
         private_key: String,
         peer_public_key: String,
         endpoint: String,
@@ -148,12 +162,14 @@ enum RouteSpec {
     },
     Warp {
         name: String,
+        enabled: Option<bool>,
         /// How many independent WARP tunnels to build for this route (default 1). Each is its
         /// own device+driver task, so this is the knob for spreading many users' load.
         tunnels: Option<usize>,
     },
     Tor {
         name: String,
+        enabled: Option<bool>,
         data_dir: Option<String>,
     },
 }
@@ -161,11 +177,24 @@ enum RouteSpec {
 impl RouteSpec {
     fn name(&self) -> &str {
         match self {
-            RouteSpec::Socks5 { name, .. }
+            RouteSpec::System { name, .. }
+            | RouteSpec::Socks5 { name, .. }
             | RouteSpec::Http { name, .. }
             | RouteSpec::Wireguard { name, .. }
             | RouteSpec::Warp { name, .. }
             | RouteSpec::Tor { name, .. } => name,
+        }
+    }
+
+    /// Whether this route is built at all. Omitted `enabled:` means enabled.
+    fn enabled(&self) -> bool {
+        match self {
+            RouteSpec::System { enabled, .. }
+            | RouteSpec::Socks5 { enabled, .. }
+            | RouteSpec::Http { enabled, .. }
+            | RouteSpec::Wireguard { enabled, .. }
+            | RouteSpec::Warp { enabled, .. }
+            | RouteSpec::Tor { enabled, .. } => enabled.unwrap_or(true),
         }
     }
 }
@@ -194,32 +223,55 @@ fn auth_pair(u: Option<String>, p: Option<String>) -> Option<(String, String)> {
     }
 }
 
-/// Parse a `config.yaml` body into the route map (always including the implicit `direct`).
+/// Parse a `config.yaml` body into the route map (which starts with the implicit `direct`).
 /// Any malformed entry, unknown `type`, duplicate name, or use of the reserved name `direct`
-/// is an error — the caller treats that as fatal. `wireguard`/`warp` specs build (and, for
-/// `warp`, register) a tunnel eagerly, so this may block and must run inside the tokio runtime.
+/// for anything but `type: system` is an error — the caller treats that as fatal.
+/// `wireguard`/`warp` specs build (and, for `warp`, register) a tunnel eagerly, so this may
+/// block and must run inside the tokio runtime.
+///
+/// An entry with `enabled: false` is validated like any other but never built, and drops the
+/// name from the map — that is how the built-in `direct` route is turned off:
+/// `- name: direct` / `type: system` / `enabled: false`. With it gone, `/wisp/` (and
+/// `/wisp/direct/`) is refused, so nothing leaves through the server's own route table.
 pub fn routes_from_yaml(yaml: &str) -> Result<HashMap<String, Arc<Route>>, String> {
     let cfg: ConfigFile =
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("config parse error: {e}"))?;
     let mut map = direct_routes();
+    // Names seen in the file, so a duplicate is caught even when one of the pair is disabled
+    // (and so re-declaring the implicit `direct` isn't itself read as a duplicate).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for spec in cfg.routes {
         let name = spec.name().to_string();
         if name.is_empty() {
             return Err("route with empty name".into());
         }
-        if name == DIRECT {
-            return Err(format!("route name {DIRECT:?} is reserved"));
+        // `direct` is the built-in `type: system` route; the file may re-declare it (to disable
+        // it) but never repoint it at a proxy or tunnel.
+        if name == DIRECT && !matches!(spec, RouteSpec::System { .. }) {
+            return Err(format!(
+                "route name {DIRECT:?} is reserved for the built-in `type: system` route"
+            ));
         }
-        let route = build_route(spec, &name)?;
-        if map.insert(name.clone(), Arc::new(route)).is_some() {
+        if !seen.insert(name.clone()) {
             return Err(format!("duplicate route name: {name:?}"));
         }
+        if !spec.enabled() {
+            // Not built at all: a disabled `warp` registers no device, a disabled `tor` starts
+            // no arti client. Removing covers `direct`, the one name already in the map.
+            map.remove(&name);
+            tracing::info!(route = %name, "route disabled in config");
+            continue;
+        }
+        let route = build_route(spec, &name)?;
+        map.insert(name.clone(), Arc::new(route));
     }
     Ok(map)
 }
 
 fn build_route(spec: RouteSpec, name: &str) -> Result<Route, String> {
     match spec {
+        // The server's default route table — the same thing the built-in `direct` route is.
+        RouteSpec::System { .. } => Ok(Route::Direct),
         RouteSpec::Socks5 {
             address,
             username,
@@ -739,6 +791,75 @@ routes:
     #[test]
     fn yaml_rejects_reserved_direct() {
         let y = "routes:\n  - name: direct\n    type: socks5\n    address: \"127.0.0.1:1\"\n";
+        assert!(routes_from_yaml(y).is_err());
+    }
+
+    #[test]
+    fn system_type_is_a_direct_route() {
+        let y = "routes:\n  - name: lan\n    type: system\n";
+        let m = routes_from_yaml(y).unwrap();
+        assert!(matches!(&*m["lan"], Route::Direct));
+        // The built-in one is untouched.
+        assert!(matches!(&*m[DIRECT], Route::Direct));
+    }
+
+    #[test]
+    fn system_type_may_redeclare_direct() {
+        let y = "routes:\n  - name: direct\n    type: system\n";
+        let m = routes_from_yaml(y).unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(matches!(&*m[DIRECT], Route::Direct));
+    }
+
+    #[test]
+    fn disabled_direct_is_removed() {
+        let y = "routes:\n  - name: direct\n    type: system\n    enabled: false\n";
+        assert!(routes_from_yaml(y).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enabled_defaults_to_true() {
+        let y = "routes:\n  - name: a\n    type: socks5\n    address: \"127.0.0.1:1\"\n";
+        assert!(routes_from_yaml(y).unwrap().contains_key("a"));
+        let y =
+            "routes:\n  - name: a\n    type: socks5\n    enabled: true\n    address: \"127.0.0.1:1\"\n";
+        assert!(routes_from_yaml(y).unwrap().contains_key("a"));
+    }
+
+    #[test]
+    fn disabled_route_is_never_built() {
+        // A disabled entry is skipped before `build_route`, so this `warp` registers no device
+        // and this `tor` bootstraps no arti client — nothing here touches the network.
+        let y = r#"
+routes:
+  - name: w
+    type: warp
+    enabled: false
+  - name: t
+    type: tor
+    enabled: false
+  - name: s
+    type: socks5
+    enabled: false
+    address: "127.0.0.1:1"
+"#;
+        let m = routes_from_yaml(y).unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key(DIRECT));
+    }
+
+    #[test]
+    fn disabled_route_is_still_validated() {
+        // Turning a route off is not a way to smuggle a malformed entry past startup.
+        let y = "routes:\n  - name: a\n    type: socks5\n    enabled: false\n";
+        assert!(routes_from_yaml(y).is_err());
+        let y = "routes:\n  - name: \"\"\n    type: system\n    enabled: false\n";
+        assert!(routes_from_yaml(y).is_err());
+    }
+
+    #[test]
+    fn yaml_rejects_duplicate_name_when_one_is_disabled() {
+        let y = "routes:\n  - name: a\n    type: system\n  - name: a\n    type: system\n    enabled: false\n";
         assert!(routes_from_yaml(y).is_err());
     }
 

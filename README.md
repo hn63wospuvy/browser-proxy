@@ -82,8 +82,9 @@ node scripts/fetch-assets.mjs
 Outbound connections can be sent through a VPN or proxy, chosen per-navigation from a
 dropdown (on the landing page and in the top bar). Target sites then see the route's IP, not
 the server's. Routes are defined in a YAML config file (`config.yaml` by default, or set
-`CONFIG`). `direct` (no proxy) always exists; the dropdown is hidden when no other route is
-configured. See [`config.example.yaml`](config.example.yaml).
+`CONFIG`). The built-in `direct` route (`type: system` — the server's own default route table,
+no proxy) always exists; the dropdown is hidden when no other route is configured. See
+[`config.example.yaml`](config.example.yaml).
 
 The same file also sets the **bind address** (optional; `BIND`/`PORT` env vars override it):
 
@@ -93,10 +94,16 @@ bind:
   port: 8080
 
 routes:
+  # The server's own route table. It exists implicitly, so list it only to turn it off:
+  # - name: direct
+  #   type: system
+  #   enabled: false
+
   # Cloudflare WARP, registered in-process (one binary, no warp-cli / wireproxy):
   - name: warp
     type: warp
     tunnels: 4             # optional: independent tunnels, dialed round-robin (default 1, max 16)
+    # enabled: false       # optional on every route (default true): keep the entry, skip the route
 
   # A generic WireGuard peer you configure yourself (e.g. wgcf-generated):
   - name: myvpn
@@ -129,6 +136,11 @@ in the UI.
 
 ### Route types
 
+- **`system`** — the server's own default route table: no proxy, no tunnel, the target sees the
+  server's IP. This is the built-in `direct` route, which exists without any entry in the file.
+  Give it an entry to switch it off (`- name: direct` / `type: system` / `enabled: false`) — then
+  `/wisp/` is refused like any unknown route and nothing can leave through the server's own
+  address — or to expose the same direct connection under an additional name.
 - **`warp`** — an embedded Cloudflare WARP tunnel. The server registers a WARP account on
   first start (via Cloudflare's unofficial registration API, the same one `wgcf` uses) and
   caches the credentials to `warp-<name>.json` (mode `0600` on Unix) so it does not
@@ -145,6 +157,10 @@ in the UI.
 - **`socks5`** — any SOCKS5 proxy (an external Tor daemon on `127.0.0.1:9050`; WARP via
   `warp-cli mode proxy` on `127.0.0.1:40000`; etc.).
 - **`http`** — any HTTP proxy that supports the CONNECT method.
+
+Every route also takes **`enabled`** (default `true`). `enabled: false` keeps the entry in the
+file but never builds the route, so a disabled `warp` registers no device and a disabled `tor`
+starts no Tor client; the route simply isn't offered.
 
 The `warp` and `wireguard` tunnels are userspace ([`boringtun`](https://github.com/cloudflare/boringtun)
 + [`smoltcp`](https://github.com/smoltcp-rs/smoltcp)); they need no root, no `NET_ADMIN`, and

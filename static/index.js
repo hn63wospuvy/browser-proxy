@@ -11,6 +11,10 @@ const frameHost = document.getElementById("frame-host");
 const routeSelect = document.getElementById("proxy-route-landing");
 const routePicker = document.getElementById("route-picker");
 const ROUTE_KEY = "proxy-route";
+// The route used while the picker is hidden — i.e. when the server offers exactly one route.
+// Usually `direct`, but a config can disable `direct` (`type: system`, `enabled: false`), and
+// then the only route is something else; sending "direct" anyway would get the upgrade refused.
+let defaultRoute = "direct";
 
 // Search-engine select. Pure client-side: picks the search template.
 const engineSelect = document.getElementById("proxy-engine-landing");
@@ -74,7 +78,8 @@ async function loadRoutes() {
   } catch (_) {
     /* fall back to direct-only */
   }
-  if (routes.length <= 1) return; // only `direct`: leave the picker hidden
+  defaultRoute = routes[0];
+  if (routes.length <= 1) return; // a single route: leave the picker hidden and use it implicitly
 
   const saved = localStorage.getItem(ROUTE_KEY);
   const value = saved && routes.includes(saved) ? saved : routes[0];
@@ -83,7 +88,7 @@ async function loadRoutes() {
 }
 
 function currentRoute() {
-  return !routePicker.hidden ? routeSelect.value : "direct";
+  return !routePicker.hidden ? routeSelect.value : defaultRoute;
 }
 
 // Apply a route change: persist, and — while browsing — rebuild the transport (which tears down
@@ -1329,7 +1334,7 @@ function flashRow(label, value) {
 // Flash the current Route / Search engine / DNS, dimmed, fading out over ~1s (CSS animation).
 function showConfigFlash() {
   if (!configFlash) return;
-  const route = !routePicker.hidden ? routeSelect.value : "direct";
+  const route = currentRoute();
   const dns = dnsValue() || dnsDefault;
   const rows = [
     // The profile owns every row below it — and one is always active now, so it always shows.

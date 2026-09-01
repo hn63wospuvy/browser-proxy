@@ -36,7 +36,8 @@ pub struct Config {
     pub block_private: bool,
     /// Hostnames containing any of these substrings are refused.
     pub host_blacklist: Vec<String>,
-    /// Named outbound routes selectable via `?route=`. Always contains `direct`.
+    /// Named outbound routes selectable via `?route=`. Contains `direct` (the built-in
+    /// `type: system` route) unless the config file explicitly disables it.
     pub routes: HashMap<String, Arc<Route>>,
     /// Named DNS resolvers selectable via `?dns=` (applies to the `direct` route only). Always
     /// contains `system` (the OS resolver) plus the built-in DoH presets.

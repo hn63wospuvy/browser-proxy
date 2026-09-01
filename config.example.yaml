@@ -39,11 +39,27 @@ storage:
   # ID identifies a browser but proves nothing — anyone who learns one can read that document —
   # so keep the bind loopback-only (or add auth in front) if that matters.
 
-# Routes selectable from the UI. `direct` (no proxy) always exists implicitly.
+# Routes selectable from the UI. The built-in `direct` route (`type: system` — the server's own
+# default route table, no proxy) always exists implicitly, so it needs no entry here.
+#
+# Every route accepts `enabled` (default true). `enabled: false` keeps the entry in the file but
+# drops the route: it is never built, so a disabled `warp` registers no device and a disabled
+# `tor` bootstraps no arti client.
 routes:
+  # The server's default route table. Listed here only to turn it off — with this, no traffic
+  # leaves through the server's own IP and the UI offers just the routes below.
+  # - name: direct
+  #   type: system
+  #   enabled: false
+  #
+  # `type: system` under another name is the same direct connection, just a second label for it:
+  # - name: local
+  #   type: system
+
   # Cloudflare WARP, registered in-process (one binary, no warp-cli):
   - name: warp
     type: warp
+    # enabled: false        # keep the entry, don't build the route (no device registration)
     # Independent tunnels to spread load across, dialed round-robin (default 1, max 16). Each
     # one is its own registered device — own keys, own exit address, own driver task (a tunnel
     # driver is single-threaded) and own 16k source-port space. Raise it when several people

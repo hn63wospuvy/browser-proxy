@@ -46,6 +46,9 @@
 
   // Config loaded from the server (same endpoints the app shell uses).
   var routes = ["direct"];
+  // Route used while the picker is hidden (a single server route). `direct` can be disabled in
+  // the server config, in which case that lone route is something else.
+  var defaultRoute = "direct";
   var dnsDefault = "system";
   var dnsNames = ["system"]; // resolver names from /dns.json, for the preset-vs-custom decision
   // Sentinel value of the "Tùy chỉnh…" option — matches DNS_CUSTOM in index.js.
@@ -164,7 +167,7 @@
 
   function currentRoute() {
     var v = ls(ROUTE_KEY);
-    return v && routes.indexOf(v) >= 0 ? v : "direct";
+    return v && routes.indexOf(v) >= 0 ? v : defaultRoute;
   }
   function currentDns() {
     var v = (ls(DNS_KEY) || "").trim();
@@ -407,7 +410,8 @@
     })
     .then(function (j) {
       if (j && Array.isArray(j.routes) && j.routes.length) routes = j.routes;
-      if (routes.length <= 1) return; // only `direct`: leave the route picker hidden
+      defaultRoute = routes[0];
+      if (routes.length <= 1) return; // a single route: hidden picker, used implicitly
       routeSel.replaceChildren();
       for (var k = 0; k < routes.length; k++) {
         var op = document.createElement("option");
