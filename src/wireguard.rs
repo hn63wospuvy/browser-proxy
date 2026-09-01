@@ -58,6 +58,22 @@ const DEAD_AFTER_FAILED_DIALS: u32 = 3;
 /// — so an ungated retry loop turns a blip into a permanent outage.
 const REREGISTER_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// How long an unanswered handshake initiation is given before the source port is redrawn.
+/// Cloudflare's WARP endpoint is anycast: the UDP 5-tuple picks the edge server, and some of
+/// them never answer a given device's handshake at all. That outcome is *sticky to the source
+/// port* — retransmitting from the same socket re-hashes to the same silent edge forever — so a
+/// stalled handshake is a routing draw to redo, not a slow peer to wait for. A good edge answers
+/// in well under a second, so this is generous.
+const HANDSHAKE_REBIND_AFTER: Duration = Duration::from_millis(1500);
+
+/// Rebinds to try before concluding the device itself is gone and re-registering. Each draw is
+/// independent, so this makes a run of bad edges vanishingly unlikely while still bounding how
+/// long a genuinely culled device looks merely unlucky.
+const MAX_HANDSHAKE_REBINDS: u32 = 10;
+
+/// WireGuard message type 1: handshake initiation.
+const HANDSHAKE_INITIATION: u8 = 1;
+
 // ===================== WARP registration =====================
 
 /// The subset of the WARP registration response we need.
@@ -616,21 +632,15 @@ enum Cmd {
     /// driver pumps every socket after each command, so arriving is the whole point — it just
     /// saves waiting up to one tick before smoltcp gets drained again.
     Resume,
-    /// Re-register WARP fresh and rebuild the tunnel session with new keys/endpoint. Replies
-    /// `Ok` once the new session is starting, `Err` if re-registration isn't possible or failed.
-    Reregister {
-        reply: oneshot::Sender<Result<(), ()>>,
-    },
 }
 
 /// How a single tunnel session ended, telling the driver's outer loop what to do next.
 enum SessionEnd {
     /// The command channel closed (all `WgStream`s + the tunnel dropped) — stop the driver.
     Shutdown,
-    /// A re-registration is due — either a `Reregister` command (which carries a reply) or the
-    /// session itself concluding the tunnel is dead. The outer loop re-registers and starts a
-    /// new session.
-    Reregister(Option<oneshot::Sender<Result<(), ()>>>),
+    /// The session concluded the device itself is gone (not just a badly-drawn source port —
+    /// see `HANDSHAKE_REBIND_AFTER`). The outer loop re-registers and starts a new session.
+    Reregister,
 }
 
 /// Shared handle to a WireGuard tunnel. Cheap to clone (just the command sender).
@@ -652,7 +662,6 @@ impl WgTunnel {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let address_v4 = cfg.address_v4;
         let self_tx = cmd_tx.clone();
-        let can_reregister = reregister.is_some();
         tokio::spawn(async move {
             if let Err(e) = driver(cfg, cmd_rx, self_tx, reregister).await {
                 tracing::warn!("wireguard tunnel driver exited: {e}");
@@ -668,50 +677,25 @@ impl WgTunnel {
         // isn't delayed by it (WARP/WG otherwise handshakes lazily on the first dial). Dialing
         // 1.1.1.1:53 — reachable through the tunnel, and the resolver it already uses for DNS —
         // drives boringtun's handshake to completion; the throwaway stream is dropped immediately.
+        // The window covers the session's whole rebind budget (see HANDSHAKE_REBIND_AFTER), since
+        // reaching an edge that answers can take several source ports; the session escalates to
+        // re-registration on its own once it has exhausted them, so there is nothing to do here
+        // but report. Failing this is not fatal either way: the tunnel keeps healing behind the
+        // warm-up and the first real request rides whatever session it lands on.
         let warm = Arc::clone(&tunnel);
+        let warm_window =
+            HANDSHAKE_REBIND_AFTER * (MAX_HANDSHAKE_REBINDS + 3) + Duration::from_secs(2);
         tokio::spawn(async move {
-            let warm_dial = || warm.dial("1.1.1.1", 53, Duration::from_secs(10));
-            match warm_dial().await {
+            match warm.dial("1.1.1.1", 53, warm_window).await {
                 Ok(_) => tracing::info!("wireguard route pre-connected"),
-                // A WARP route that can't handshake is usually a culled registration (see
-                // register_fresh): re-register once and retry. A static WG route can't recover
-                // this way, so it just reports the failure.
-                Err(_) if can_reregister => {
-                    tracing::warn!(
-                        "wireguard route pre-connect failed; re-registering WARP \
-                         (the cached device may have been culled by Cloudflare)"
-                    );
-                    match warm.reregister().await {
-                        Ok(()) => match warm_dial().await {
-                            Ok(_) => tracing::info!("wireguard route re-registered and pre-connected"),
-                            Err(reason) => tracing::warn!(
-                                "wireguard route still unreachable after re-registration \
-                                 (wisp reason code {reason}); will retry on first real use"
-                            ),
-                        },
-                        Err(()) => tracing::warn!(
-                            "WARP re-registration failed; route will retry on first real use"
-                        ),
-                    }
-                }
                 Err(reason) => tracing::warn!(
                     "wireguard route pre-connect warm-up failed (wisp reason code {reason}); \
-                     route will connect on first real use"
+                     route will keep retrying and connect on first real use"
                 ),
             }
         });
 
         tunnel
-    }
-
-    /// Ask the driver to re-register WARP fresh and rebuild the tunnel session. Resolves once the
-    /// new session is starting (or `Err` if re-registration is unavailable or failed).
-    async fn reregister(&self) -> Result<(), ()> {
-        let (reply, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Cmd::Reregister { reply })
-            .map_err(|_| ())?;
-        rx.await.map_err(|_| ())?
     }
 
     /// Dial `host:port` through the tunnel. Hostnames are resolved via 1.1.1.1 inside the
@@ -1156,11 +1140,39 @@ fn pump_sockets(
     dead
 }
 
+/// A fresh UDP socket for the tunnel, connected to the WireGuard endpoint. Binding to port 0
+/// draws a new source port, which is what picks the anycast edge — see [`HANDSHAKE_REBIND_AFTER`].
+async fn bind_endpoint(endpoint: SocketAddr) -> Result<UdpSocket, String> {
+    let udp = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("udp bind: {e}"))?;
+    udp.connect(endpoint)
+        .await
+        .map_err(|e| format!("udp connect: {e}"))?;
+    Ok(udp)
+}
+
+/// Send one encapsulated packet, starting the rebind clock on the first handshake initiation that
+/// has yet to be answered. Cleared by anything that decapsulates, so the clock only runs while a
+/// handshake is genuinely outstanding — an idle tunnel sends nothing and never rebinds.
+async fn send_wg(udp: &UdpSocket, packet: &[u8], init_sent_at: &mut Option<std::time::Instant>) {
+    if packet.first() == Some(&HANDSHAKE_INITIATION) && init_sent_at.is_none() {
+        *init_sent_at = Some(std::time::Instant::now());
+    }
+    let _ = udp.send(packet).await;
+}
+
 /// Encrypt everything smoltcp queued and send it over UDP.
-async fn drain_tx(device: &mut TunDevice, tunn: &mut Tunn, udp: &UdpSocket, scratch: &mut [u8]) {
+async fn drain_tx(
+    device: &mut TunDevice,
+    tunn: &mut Tunn,
+    udp: &UdpSocket,
+    scratch: &mut [u8],
+    init_sent_at: &mut Option<std::time::Instant>,
+) {
     while let Some(pkt) = device.tx.pop_front() {
         if let TunnResult::WriteToNetwork(b) = tunn.encapsulate(&pkt, scratch) {
-            let _ = udp.send(b).await;
+            send_wg(udp, b, init_sent_at).await;
         }
     }
 }
@@ -1188,14 +1200,9 @@ async fn driver(
         .await?;
         match end {
             SessionEnd::Shutdown => return Ok(()),
-            SessionEnd::Reregister(reply) => {
+            SessionEnd::Reregister => {
                 // Only a WARP route can recover this way; a static WG route has no cache to renew.
-                let Some(path) = reregister.clone() else {
-                    if let Some(reply) = reply {
-                        let _ = reply.send(Err(()));
-                    }
-                    continue;
-                };
+                let Some(path) = reregister.clone() else { continue };
                 // register_fresh does blocking HTTP, so run it off the async driver task. The next
                 // run_session() rebuilds every session-local resource from the new cfg.
                 match tokio::task::spawn_blocking(move || register_fresh(&path)).await {
@@ -1204,22 +1211,9 @@ async fn driver(
                             "WARP re-registered (previous device culled); reconnecting tunnel"
                         );
                         cfg = new_cfg;
-                        if let Some(reply) = reply {
-                            let _ = reply.send(Ok(()));
-                        }
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!("WARP re-registration failed: {e}");
-                        if let Some(reply) = reply {
-                            let _ = reply.send(Err(()));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("WARP re-registration task failed: {e}");
-                        if let Some(reply) = reply {
-                            let _ = reply.send(Err(()));
-                        }
-                    }
+                    Ok(Err(e)) => tracing::warn!("WARP re-registration failed: {e}"),
+                    Err(e) => tracing::warn!("WARP re-registration task failed: {e}"),
                 }
             }
         }
@@ -1240,21 +1234,24 @@ async fn run_session(
 ) -> Result<SessionEnd, String> {
     // Every stream opened from here on belongs to this session.
     let my_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
-    let udp = UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(|e| format!("udp bind: {e}"))?;
-    udp.connect(cfg.endpoint)
-        .await
-        .map_err(|e| format!("udp connect: {e}"))?;
+    let mut udp = bind_endpoint(cfg.endpoint).await?;
 
-    let mut tunn = Tunn::new(
-        StaticSecret::from(cfg.private_key),
-        PublicKey::from(cfg.peer_public_key),
-        None,
-        Some(25), // persistent keepalive
-        0,
-        None,
-    );
+    let new_tunn = || {
+        Tunn::new(
+            StaticSecret::from(cfg.private_key),
+            PublicKey::from(cfg.peer_public_key),
+            None,
+            Some(25), // persistent keepalive
+            0,
+            None,
+        )
+    };
+    let mut tunn = new_tunn();
+    // Rebind state: when the oldest unanswered handshake went out, and how many source ports this
+    // session has burned through looking for an edge that answers.
+    let mut init_sent_at: Option<std::time::Instant> = None;
+    let mut rebinds: u32 = 0;
+    let mut handshake_ok = false;
 
     let mut device = TunDevice {
         rx: VecDeque::new(),
@@ -1298,9 +1295,14 @@ async fn run_session(
                 // blackholed hosts on an idle tunnel from being read as a dead tunnel.
                 if !matches!(res, TunnResult::Err(_)) {
                     health.alive();
+                    // This source port reached an edge that talks back, so it is not one of the
+                    // silent draws: stop the rebind clock and forgive the ports already burned.
+                    handshake_ok = true;
+                    init_sent_at = None;
+                    rebinds = 0;
                 }
                 while let TunnResult::WriteToNetwork(b) = res {
-                    let _ = udp.send(b).await;
+                    send_wg(&udp, b, &mut init_sent_at).await;
                     res = tunn.decapsulate(None, &[], &mut scratch);
                 }
                 if let TunnResult::WriteToTunnelV4(pkt, _) = res {
@@ -1310,21 +1312,49 @@ async fn run_session(
             _ = tick.tick() => {
                 // Drive boringtun timers: initial handshake, retransmits, keepalive, rekey.
                 if let TunnResult::WriteToNetwork(b) = tunn.update_timers(&mut scratch) {
-                    let _ = udp.send(b).await;
+                    send_wg(&udp, b, &mut init_sent_at).await;
+                }
+                // A handshake this stale is misrouted rather than slow (see
+                // HANDSHAKE_REBIND_AFTER), and boringtun would retransmit from the same silent
+                // source port forever. Redraw it. Only before the session's first answer: after
+                // that the edge is known good and a live session is not worth tearing down — if
+                // it later goes silent, the failed-dial streak below escalates instead.
+                if !handshake_ok
+                    && init_sent_at.is_some_and(|t| t.elapsed() >= HANDSHAKE_REBIND_AFTER)
+                {
+                    if rebinds >= MAX_HANDSHAKE_REBINDS {
+                        // Every edge we drew stayed silent: now the device itself is the suspect.
+                        rebinds = 0;
+                        if can_reregister && gate.allow(std::time::Instant::now()) {
+                            tracing::warn!(
+                                source_ports = MAX_HANDSHAKE_REBINDS,
+                                "wireguard handshake unanswered from every source port tried; \
+                                 re-registering WARP (the device looks culled)"
+                            );
+                            return Ok(SessionEnd::Reregister);
+                        }
+                    }
+                    rebinds += 1;
+                    // Keys and the tunnel's inner address are unchanged, so smoltcp's sockets (and
+                    // any stream on them) ride through this untouched — only the outer UDP flow
+                    // and the crypto handshake start over.
+                    udp = bind_endpoint(cfg.endpoint).await?;
+                    tunn = new_tunn();
+                    init_sent_at = None;
+                    tracing::debug!(
+                        attempt = rebinds,
+                        "wireguard handshake unanswered; redrawing the UDP source port"
+                    );
+                    if let TunnResult::WriteToNetwork(b) =
+                        tunn.format_handshake_initiation(&mut scratch, true)
+                    {
+                        send_wg(&udp, b, &mut init_sent_at).await;
+                    }
                 }
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     None => return Ok(SessionEnd::Shutdown),
-                    Some(Cmd::Reregister { reply }) => {
-                        if gate.allow(std::time::Instant::now()) {
-                            return Ok(SessionEnd::Reregister(Some(reply)));
-                        }
-                        // Refusing here keeps this session (and its live streams) intact rather
-                        // than tearing it down for a registration Cloudflare would throttle.
-                        tracing::warn!("WARP re-registration refused: still in cooldown");
-                        let _ = reply.send(Err(()));
-                    }
                     Some(Cmd::Dial { ip, port, reply }) => {
                         let ip4 = match ip {
                             IpAddr::V4(v4) => v4,
@@ -1387,7 +1417,7 @@ async fn run_session(
         let now = SmolInstant::now();
         iface.poll(now, &mut device, &mut sockets);
         let presumed_dead = pump_sockets(now, &mut sockets, &mut states, &mut ports, &mut health);
-        drain_tx(&mut device, &mut tunn, &udp, &mut scratch).await;
+        drain_tx(&mut device, &mut tunn, &udp, &mut scratch, &mut init_sent_at).await;
 
         // Dials keep dying with nothing at all coming back: the device has almost certainly been
         // culled. Self-heal mid-run rather than staying dead until the process restarts.
@@ -1398,7 +1428,7 @@ async fn run_session(
                 "wireguard tunnel presumed dead (dials failing with no reply at all); \
                  re-registering — live streams on it will be reset"
             );
-            return Ok(SessionEnd::Reregister(None));
+            return Ok(SessionEnd::Reregister);
         }
     }
 }
